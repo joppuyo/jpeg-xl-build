@@ -23,3 +23,5 @@ jobs:
            export LDFLAGS="-L/usr/local/opt/jpeg-turbo/lib" &&
            export CPPFLAGS="-I/usr/local/opt/jpeg-turbo/include" &&
            ./ci.sh release
+    - name: List
+      run: ls -al build
