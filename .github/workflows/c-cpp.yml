@@ -13,6 +13,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
+      with:
+        submodules: recursive
     - name: Install dependencies
       run: brew install clang-format coreutils cmake giflib libjpeg ninja parallel
     - name: Build
