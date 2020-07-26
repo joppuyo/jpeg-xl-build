@@ -23,6 +23,8 @@ set(JPEGXL_EXTRAS_SOURCES
   jxl/extras/codec_pnm.h
 )
 
+set(CMAKE_FIND_FRAMEWORK LAST)
+
 find_package(GIF 5)
 find_package(JPEG)
 find_package(ZLIB)  # dependency of PNG
