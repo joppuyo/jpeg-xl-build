@@ -16,6 +16,6 @@ jobs:
       with:
         submodules: recursive
     - name: Install dependencies
-      run: brew install clang-format coreutils cmake giflib libjpeg ninja parallel
+      run: brew install clang-format coreutils cmake giflib libjpeg ninja parallel doxygen
     - name: Build
       run: ./ci.sh release
