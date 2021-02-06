@@ -24,6 +24,7 @@ OS=`uname -s`
 MYDIR=$(dirname $(realpath "$0"))
 
 ### Environment parameters:
+TEST_STACK_LIMIT="${TEST_STACK_LIMIT:-128}"
 CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-RelWithDebInfo}
 CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}
 CMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER:-}
@@ -39,6 +40,10 @@ else
 fi
 # Whether we should post a message in the MR when the build fails.
 POST_MESSAGE_ON_ERROR="${POST_MESSAGE_ON_ERROR:-1}"
+
+# Set default compilers to clang if not already set
+export CC=${CC:-clang}
+export CXX=${CXX:-clang++}
 
 # Time limit for the "fuzz" command in seconds (0 means no limit).
 FUZZER_MAX_TIME="${FUZZER_MAX_TIME:-0}"
@@ -83,9 +88,9 @@ CMAKE_SHARED_LINKER_FLAGS=${CMAKE_SHARED_LINKER_FLAGS:-}
 CMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE:-}
 
 if [[ "${ENABLE_WASM_SIMD}" -ne "0" ]]; then
-  CMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS} -s SIMD=1"
-  CMAKE_C_FLAGS="${CMAKE_C_FLAGS} -s SIMD=1"
-  CMAKE_EXE_LINKER_FLAGS="${CMAKE_EXE_LINKER_FLAGS} -s SIMD=1"
+  CMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS} -msimd128"
+  CMAKE_C_FLAGS="${CMAKE_C_FLAGS} -msimd128"
+  CMAKE_EXE_LINKER_FLAGS="${CMAKE_EXE_LINKER_FLAGS} -msimd128"
 fi
 
 if [[ ! -z "${HWY_BASELINE_TARGETS}" ]]; then
@@ -157,6 +162,7 @@ detect_clang_version() {
     return 0
   fi
   local clang_version=$("${CC:-clang}" --version | head -n1)
+  clang_version=${clang_version#"Debian "}
   local llvm_tag
   case "${clang_version}" in
     "clang version 6."*)
@@ -298,7 +304,8 @@ export_env() {
       | grep -F 'libraries: =' | cut -f 2- -d '=' | tr ':' ';')
     # We also need our own libraries in the wine path.
     local real_build_dir=$(realpath "${BUILD_DIR}")
-    export WINEPATH="${WINEPATH};${real_build_dir}"
+    # Some library .dll dependencies are installed in /bin:
+    export WINEPATH="${WINEPATH};${real_build_dir};/usr/${BUILD_TARGET}/bin"
 
     local prefix="${BUILD_DIR}/wineprefix"
     mkdir -p "${prefix}"
@@ -316,6 +323,14 @@ export_env() {
 
 cmake_configure() {
   export_env
+
+  if [[ "${STACK_SIZE:-0}" == 1 ]]; then
+    # Dump the stack size of each function in the .stack_sizes section for
+    # analysis.
+    CMAKE_C_FLAGS+=" -fstack-size-section"
+    CMAKE_CXX_FLAGS+=" -fstack-size-section"
+  fi
+
   local args=(
     -B"${BUILD_DIR}" -H"${MYDIR}"
     -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
@@ -328,6 +343,10 @@ cmake_configure() {
     -DCMAKE_SHARED_LINKER_FLAGS="${CMAKE_SHARED_LINKER_FLAGS}"
     -DJPEGXL_VERSION="${JPEGXL_VERSION}"
     -DSANITIZER="${SANITIZER}"
+    # These are not enabled by default in cmake.
+    -DJPEGXL_ENABLE_VIEWERS=ON
+    -DJPEGXL_ENABLE_PLUGINS=ON
+    -DJPEGXL_ENABLE_DEVTOOLS=ON
   )
   if [[ -n "${BUILD_TARGET}" ]]; then
     local system_name="Linux"
@@ -353,6 +372,11 @@ cmake_configure() {
         # Only the first element of the target triplet.
         -DCMAKE_SYSTEM_PROCESSOR="${BUILD_TARGET%%-*}"
         -DCMAKE_SYSTEM_NAME="${system_name}"
+      )
+    else
+      # sjpeg confuses WASM SIMD with SSE.
+      args+=(
+        -DSJPEG_ENABLE_SIMD=OFF
       )
     fi
     args+=(
@@ -438,6 +462,7 @@ cmake_build_and_test() {
   if [[ "${SKIP_TEST}" -ne "1" ]]; then
     (cd "${BUILD_DIR}"
      export UBSAN_OPTIONS=print_stacktrace=1
+     [[ "${TEST_STACK_LIMIT}" == "none" ]] || ulimit -s "${TEST_STACK_LIMIT}"
      ctest -j $(nproc --all || echo 1) --output-on-failure)
   fi
 }
@@ -531,6 +556,7 @@ cmd_test() {
   fi
   (cd "${BUILD_DIR}"
    export UBSAN_OPTIONS=print_stacktrace=1
+   [[ "${TEST_STACK_LIMIT}" == "none" ]] || ulimit -s "${TEST_STACK_LIMIT}"
    ctest -j $(nproc --all || echo 1) --output-on-failure "$@")
 }
 
@@ -749,7 +775,7 @@ run_benchmark() {
 
   local benchmark_args=(
     --input "${src_img_dir}/*.png"
-    --codec=jpeg:yuv420:q85,webp:q80,jxl:fast:d1,jxl:fast:d1:downsampling=8,jxl:fast:d4,jxl:fast:d4:downsampling=8,jxl:mg:cheetah:nl,jxl:cheetah:mg,jxl:mg:cheetah:P6,jxl:mg:falcon:q80
+    --codec=jpeg:yuv420:q85,webp:q80,jxl:fast:d1,jxl:fast:d1:downsampling=8,jxl:fast:d4,jxl:fast:d4:downsampling=8,jxl:m:cheetah:nl,jxl:cheetah:m,jxl:m:cheetah:P6,jxl:m:falcon:q80
     --output_dir "${output_dir}"
     --noprofiler --show_progress
     --num_threads="${num_threads}"
@@ -757,10 +783,14 @@ run_benchmark() {
   if [[ "${STORE_IMAGES}" == "1" ]]; then
     benchmark_args+=(--save_decompressed --save_compressed)
   fi
-  "${BUILD_DIR}/tools/benchmark_xl" "${benchmark_args[@]}" | \
-     tee "${output_dir}/results.txt"
-  # Check error code for benckmark_xl command. This will exit if not.
-  [[ "${PIPESTATUS[0]}" == 0 ]]
+  (
+    [[ "${TEST_STACK_LIMIT}" == "none" ]] || ulimit -s "${TEST_STACK_LIMIT}"
+    "${BUILD_DIR}/tools/benchmark_xl" "${benchmark_args[@]}" | \
+       tee "${output_dir}/results.txt"
+
+    # Check error code for benckmark_xl command. This will exit if not.
+    return ${PIPESTATUS[0]}
+  )
 
   if [[ -n "${CI_BUILD_NAME:-}" ]]; then
     { set +x; } 2>/dev/null
@@ -814,42 +844,52 @@ cmd_cpuset() {
 
 # Return the encoding/decoding speed from the Stats output.
 _speed_from_output() {
-  local speed="$@"
-  speed="${speed%% MP/s*}"
-  speed="${speed##* }"
-  echo "${speed}"
+  local speed="$1"
+  local unit="${2:-MP/s}"
+  if [[ "${speed}" == *"${unit}"* ]]; then
+    speed="${speed%% ${unit}*}"
+    speed="${speed##* }"
+    echo "${speed}"
+  fi
 }
+
 
 # Run benchmarks on ARM for the big and little CPUs.
 cmd_arm_benchmark() {
-  local benchmarks=(
+  # Flags used for cjxl encoder with .png inputs
+  local jxl_png_benchmarks=(
     # Lossy options:
-    "--jpeg1 --jpeg_quality 90"
-    "--jpeg1 --jpeg_quality 85 --jpeg_420"
-    "--adaptive_reconstruction=1 --distance=1.0 --speed=cheetah"
-    "--adaptive_reconstruction=0 --distance=1.0 --speed=cheetah"
-    "--adaptive_reconstruction=1 --distance=8.0 --speed=cheetah"
-    "--adaptive_reconstruction=0 --distance=8.0 --speed=cheetah"
-    "--modular-group -Q 90"
-    "--modular-group -Q 50"
+    "--epf=0 --distance=1.0 --speed=cheetah"
+    "--epf=2 --distance=1.0 --speed=cheetah"
+    "--epf=0 --distance=8.0 --speed=cheetah"
+    "--epf=1 --distance=8.0 --speed=cheetah"
+    "--epf=2 --distance=8.0 --speed=cheetah"
+    "--epf=3 --distance=8.0 --speed=cheetah"
+    "--modular -Q 90"
+    "--modular -Q 50"
     # Lossless options:
-    "--modular-group"
-    "--modular-group -E 0 -I 0"
-    "--modular-group -P 5"
-    "--modular-group --responsive=1"
+    "--modular"
+    "--modular -E 0 -I 0"
+    "--modular -P 5"
+    "--modular --responsive=1"
     # Near-lossless options:
-    "--adaptive_reconstruction=0 --distance=0.3 --speed=fast"
-    "--modular-group -N 3 -B 11"
-    "--modular-group -Q 97"
+    "--epf=0 --distance=0.3 --speed=fast"
+    "--modular -N 3 -I 0"
+    "--modular -Q 97"
   )
 
-  local brunsli_benchmarks=(
-    "--num_reps=6 --quant=0"
-    "--num_reps=6 --quant=20"
+  # Flags used for cjxl encoder with .jpg inputs. These should do lossless
+  # JPEG recompression (of pixels or full jpeg).
+  local jxl_jpeg_benchmarks=(
+    "--num_reps=3"
   )
 
   local images=(
     "third_party/testdata/imagecompression.info/flower_foveon.png"
+  )
+
+  local jpg_images=(
+    "third_party/testdata/imagecompression.info/flower_foveon.png.im_q85_420.jpg"
   )
 
   if [[ "${SKIP_CPUSET:-}" == "1" ]]; then
@@ -872,12 +912,11 @@ cmd_arm_benchmark() {
 
   local jpg_dirname="third_party/corpora/jpeg"
   mkdir -p "${jpg_dirname}"
-  local jpg_images=()
   local jpg_qualities=( 50 80 95 )
   for src_img in "${images[@]}"; do
     for q in "${jpg_qualities[@]}"; do
       local jpeg_name="${jpg_dirname}/"$(basename "${src_img}" .png)"-q${q}.jpg"
-      "${BUILD_DIR}/tools/cjpegxl" --jpeg1 --jpeg_quality "${q}" \
+      convert -sampling-factor 1x1 -quality "${q}" \
         "${src_img}" "${jpeg_name}"
       jpg_images+=("${jpeg_name}")
     done
@@ -888,7 +927,7 @@ cmd_arm_benchmark() {
   local runs_file="${output_dir}/runs.txt"
 
   if [[ ! -e "${runs_file}" ]]; then
-    echo -e "flags\tsrc_img\tsrc size\tsrc pixels\tcpuset\tenc size (B)\tenc speed (MP/s)\tdec speed (MP/s)" |
+    echo -e "binary\tflags\tsrc_img\tsrc size\tsrc pixels\tcpuset\tenc size (B)\tenc speed (MP/s)\tdec speed (MP/s)\tJPG dec speed (MP/s)\tJPG dec speed (MB/s)" |
       tee -a "${runs_file}"
   fi
 
@@ -897,61 +936,87 @@ cmd_arm_benchmark() {
   local src_img
   for src_img in "${jpg_images[@]}" "${images[@]}"; do
     local src_img_hash=$(sha1sum "${src_img}" | cut -f 1 -d ' ')
-    local img_benchmarks=("${benchmarks[@]}")
-    local enc_binary="${BUILD_DIR}/tools/cjpegxl"
+    local enc_binaries=("${BUILD_DIR}/tools/cjxl")
     local src_ext="${src_img##*.}"
-    if [[ "${src_ext}" == "jpg" ]]; then
-      img_benchmarks=("${brunsli_benchmarks[@]}")
-      enc_binary="${BUILD_DIR}/tools/cbrunsli"
-    fi
-    for flags in "${img_benchmarks[@]}"; do
-      # Encoding step.
-      local enc_file_hash="$flags || ${src_img} || ${src_img_hash}"
-      enc_file_hash=$(echo "${enc_file_hash}" | sha1sum | cut -f 1 -d ' ')
-      local enc_file="${BUILD_DIR}/arm_benchmark/${enc_file_hash}.jxl"
+    for enc_binary in "${enc_binaries[@]}"; do
+      local enc_binary_base=$(basename "${enc_binary}")
 
-      for cpu_conf in "${cpu_confs[@]}"; do
-        cmd_cpuset "${cpu_conf}"
-        # nproc returns the number of active CPUs, which is given by the cpuset
-        # mask.
-        local num_threads="$(nproc)"
+      # Select the list of flags to use for the current encoder/image pair.
+      local img_benchmarks
+      if [[ "${src_ext}" == "jpg" ]]; then
+        img_benchmarks=("${jxl_jpeg_benchmarks[@]}")
+      else
+        img_benchmarks=("${jxl_png_benchmarks[@]}")
+      fi
 
-        echo "Encoding with: img=${src_img} cpus=${cpu_conf} enc_flags=${flags}"
-        local enc_output
-        if [[ "${flags}" == *"modular-group"* ]]; then
-          # We don't benchmark encoding speed in this case.
-          if [[ ! -f "${enc_file}" ]]; then
-            cmd_cpuset "${RUNNER_CPU_ALL:-}"
-            "${enc_binary}" ${flags} "${src_img}" "${enc_file}.tmp"
+      for flags in "${img_benchmarks[@]}"; do
+        # Encoding step.
+        local enc_file_hash="${enc_binary_base} || $flags || ${src_img} || ${src_img_hash}"
+        enc_file_hash=$(echo "${enc_file_hash}" | sha1sum | cut -f 1 -d ' ')
+        local enc_file="${BUILD_DIR}/arm_benchmark/${enc_file_hash}.jxl"
+
+        for cpu_conf in "${cpu_confs[@]}"; do
+          cmd_cpuset "${cpu_conf}"
+          # nproc returns the number of active CPUs, which is given by the cpuset
+          # mask.
+          local num_threads="$(nproc)"
+
+          echo "Encoding with: ${enc_binary_base} img=${src_img} cpus=${cpu_conf} enc_flags=${flags}"
+          local enc_output
+          if [[ "${flags}" == *"modular"* ]]; then
+            # We don't benchmark encoding speed in this case.
+            if [[ ! -f "${enc_file}" ]]; then
+              cmd_cpuset "${RUNNER_CPU_ALL:-}"
+              "${enc_binary}" ${flags} "${src_img}" "${enc_file}.tmp"
+              mv "${enc_file}.tmp" "${enc_file}"
+              cmd_cpuset "${cpu_conf}"
+            fi
+            enc_output=" ?? MP/s"
+          else
+            wait_for_temp
+            enc_output=$("${enc_binary}" ${flags} "${src_img}" "${enc_file}.tmp" \
+              2>&1 | tee /dev/stderr | grep -F "MP/s [")
             mv "${enc_file}.tmp" "${enc_file}"
-            cmd_cpuset "${cpu_conf}"
           fi
-          enc_output=" ?? MP/s"
-        else
+          local enc_speed=$(_speed_from_output "${enc_output}")
+          local enc_size=$(stat -c "%s" "${enc_file}")
+
+          echo "Decoding with: img=${src_img} cpus=${cpu_conf} enc_flags=${flags}"
+
+          local dec_output
           wait_for_temp
-          enc_output=$("${enc_binary}" ${flags} "${src_img}" "${enc_file}.tmp" \
-            2>&1 | grep -F "MP/s [")
-          mv "${enc_file}.tmp" "${enc_file}"
-        fi
-        local enc_speed=$(_speed_from_output "${enc_output}")
-        local enc_size=$(stat -c "%s" "${enc_file}")
+          dec_output=$("${BUILD_DIR}/tools/djxl" "${enc_file}" \
+            --num_reps=5 --num_threads="${num_threads}" 2>&1 | tee /dev/stderr |
+            grep -E "M[BP]/s \[")
+          local img_size=$(echo "${dec_output}" | cut -f 1 -d ',')
+          local img_size_x=$(echo "${img_size}" | cut -f 1 -d ' ')
+          local img_size_y=$(echo "${img_size}" | cut -f 3 -d ' ')
+          local img_size_px=$(( ${img_size_x} * ${img_size_y} ))
+          local dec_speed=$(_speed_from_output "${dec_output}")
 
-        echo "Decoding with: img=${src_img} cpus=${cpu_conf} enc_flags=${flags}"
+          # For JPEG lossless recompression modes (where the original is a JPEG)
+          # decode to JPG as well.
+          local jpeg_dec_mps_speed=""
+          local jpeg_dec_mbs_speed=""
+          if [[ "${src_ext}" == "jpg" ]]; then
+            wait_for_temp
+            local dec_file="${BUILD_DIR}/arm_benchmark/${enc_file_hash}.jpg"
+            dec_output=$("${BUILD_DIR}/tools/djxl" --jpeg "${enc_file}" \
+              "${dec_file}" --num_reps=5 --num_threads="${num_threads}" 2>&1 | \
+                tee /dev/stderr | grep -E "M[BP]/s \[")
+            local jpeg_dec_mps_speed=$(_speed_from_output "${dec_output}")
+            local jpeg_dec_mbs_speed=$(_speed_from_output "${dec_output}" MB/s)
+            if ! cmp --quiet "${src_img}" "${dec_file}"; then
+              # Add a start at the end to signal that the files are different.
+              jpeg_dec_mbs_speed+="*"
+            fi
+          fi
 
-        local dec_output
-        wait_for_temp
-        dec_output=$("${BUILD_DIR}/tools/djpegxl" "${enc_file}" \
-          --num_reps=5 --num_threads="${num_threads}" 2>&1 | grep -F "MP/s [")
-        local img_size=$(echo "${dec_output}" | cut -f 1 -d ',')
-        local img_size_x=$(echo "${img_size}" | cut -f 1 -d ' ')
-        local img_size_y=$(echo "${img_size}" | cut -f 3 -d ' ')
-        local img_size_px=$(( ${img_size_x} * ${img_size_y} ))
-        local dec_speed=$(_speed_from_output "${dec_output}")
-
-        # Record entry in a tab-separated file.
-        local src_img_base=$(basename "${src_img}")
-        echo -e "${flags}\t${src_img_base}\t${img_size}\t${img_size_px}\t${cpu_conf}\t${enc_size}\t${enc_speed}\t${dec_speed}" |
-          tee -a "${runs_file}"
+          # Record entry in a tab-separated file.
+          local src_img_base=$(basename "${src_img}")
+          echo -e "${enc_binary_base}\t${flags}\t${src_img_base}\t${img_size}\t${img_size_px}\t${cpu_conf}\t${enc_size}\t${enc_speed}\t${dec_speed}\t${jpeg_dec_mps_speed}\t${jpeg_dec_mbs_speed}" |
+            tee -a "${runs_file}"
+        done
       done
     done
   done
@@ -992,11 +1057,20 @@ cmd_fuzz() {
 # Runs the linter (clang-format) on the pending CLs.
 cmd_lint() {
   merge_request_commits
-  # { set +x; } 2>/dev/null
+  { set +x; } 2>/dev/null
   local versions=(${1:-6.0 7 8 9})
   local clang_format_bins=("${versions[@]/#/clang-format-}" clang-format)
   local tmpdir=$(mktemp -d)
   CLEANUP_FILES+=("${tmpdir}")
+
+  local ret=0
+  local build_patch="${tmpdir}/build_cleaner.patch"
+  if ! "${MYDIR}/tools/build_cleaner.py" >"${build_patch}"; then
+    ret=1
+    echo "build_cleaner.py findings:" >&2
+    "${COLORDIFF_BIN}" <"${build_patch}"
+    echo "Run \`tools/build_cleaner.py --update\` to apply them" >&2
+  fi
 
   local installed=()
   local clang_patch
@@ -1021,7 +1095,7 @@ cmd_lint() {
       clang_patch="${tmppatch}"
     else
       echo "clang-format check OK" >&2
-      return 0
+      return ${ret}
     fi
   done
 
@@ -1105,6 +1179,58 @@ EOF
   return ${ret}
 }
 
+# Print stats about all the packages built in ${BUILD_DIR}/debs/.
+cmd_debian_stats() {
+  { set +x; } 2>/dev/null
+  local debsdir="${BUILD_DIR}/debs"
+  local f
+  while IFS='' read -r -d '' f; do
+    echo "====================================================================="
+    echo "Package $f:"
+    dpkg --info $f
+    dpkg --contents $f
+  done < <(find "${BUILD_DIR}/debs" -maxdepth 1 -mindepth 1 -type f \
+           -name '*.deb' -print0)
+}
+
+build_debian_pkg() {
+  local srcdir="$1"
+  local srcpkg="$2"
+
+  local debsdir="${BUILD_DIR}/debs"
+  local builddir="${debsdir}/${srcpkg}"
+
+  # debuild doesn't have an easy way to build out of tree, so we make a copy
+  # of with all symlinks on the first level.
+  mkdir -p "${builddir}"
+  for f in $(find "${srcdir}" -mindepth 1 -maxdepth 1 -printf '%P\n'); do
+    if [[ ! -L "${builddir}/$f" ]]; then
+      rm -f "${builddir}/$f"
+      ln -s "${srcdir}/$f" "${builddir}/$f"
+    fi
+  done
+  (
+    cd "${builddir}"
+    debuild -b -uc -us
+  )
+}
+
+cmd_debian_build() {
+  local srcpkg="${1:-}"
+
+  case "${srcpkg}" in
+    jpeg-xl)
+      build_debian_pkg "${MYDIR}" "jpeg-xl"
+      ;;
+    highway)
+      build_debian_pkg "${MYDIR}/third_party/highway" "highway"
+      ;;
+    *)
+      echo "ERROR: Must pass a valid source package name to build." >&2
+      ;;
+  esac
+}
+
 main() {
   local cmd="${1:-}"
   if [[ -z "${cmd}" ]]; then
@@ -1137,6 +1263,9 @@ Where cmd is one of:
  msan_install Install the libc++ libraries required to build in msan mode. This
               needs to be done once.
 
+ debian_build <srcpkg> Build the given source package.
+ debian_stats  Print stats about the built packages.
+
 You can pass some optional environment variables as well:
  - BUILD_DIR: The output build directory (by default "$$repo/build")
  - BUILD_TARGET: The target triplet used when cross-compiling.
@@ -1148,6 +1277,8 @@ You can pass some optional environment variables as well:
  - SKIP_CPUSET=1: Skip modifying the cpuset in the arm_benchmark.
  - SKIP_TEST=1: Skip the test stage.
  - STORE_IMAGES=0: Makes the benchmark discard the computed images.
+ - TEST_STACK_LIMIT: Stack size limit (ulimit -s) during tests, in KiB.
+ - STACK_SIZE=1: Generate binaries with the .stack_sizes sections.
 
 These optional environment variables are forwarded to the cmake call as
 parameters:

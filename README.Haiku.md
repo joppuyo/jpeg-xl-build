@@ -10,11 +10,11 @@ instructions see "[README](README.md)" and
 ## Dependencies
 
 ```shell
-pkgman install llvm9_clang ninja cmake doxygen
+pkgman install llvm9_clang ninja cmake doxygen libjpeg_turbo_devel
 ```
 
 ## Building
 
 ```shell
-CMAKE_FLAGS="-I/boot/system/develop/tools/lib/gcc/x86_64-unknown-haiku/8.3.0/include/c++ -I/boot/system/develop/tools/lib/gcc/x86_64-unknown-haiku/8.3.0/include/c++/x86_64-unknown-haiku" CMAKE_SHARED_LINKER_FLAGS="-shared -Xlinker -soname=libjpegxl.so -lpthread" ./ci.sh opt
+TEST_STACK_LIMIT=none CMAKE_FLAGS="-I/boot/system/develop/tools/lib/gcc/x86_64-unknown-haiku/8.3.0/include/c++ -I/boot/system/develop/tools/lib/gcc/x86_64-unknown-haiku/8.3.0/include/c++/x86_64-unknown-haiku" CMAKE_SHARED_LINKER_FLAGS="-shared -Xlinker -soname=libjpegxl.so -lpthread" ./ci.sh opt
 ```

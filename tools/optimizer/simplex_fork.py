@@ -69,14 +69,14 @@ def EvalCacheForget():
 
 def RandomizedJxlCodecs():
   retval = []
-  minval = 0.6
-  maxval = 5.0
+  minval = 1.0
+  maxval = 6.5
   rangeval = maxval/minval
-  steps = 5
+  steps = 15
   for i in range(steps):
     mul = minval * rangeval**(float(i)/(steps - 1))
     mul *= 0.99 + 0.05 * random.random()
-    retval.append("jxl:fast:d%.3f" % mul)
+    retval.append("jxl:new_heuristics:d%.3f" % mul)
   steps = 0
   for i in range(steps):
     mul = minval * rangeval**(float(i)/(steps - 1))
@@ -110,12 +110,9 @@ def Eval(vec, binary_name, cached=True):
   process = subprocess.Popen(
       (binary_name,
        '--input',
-       '/usr/local/google/home/jyrki/jpeg_xl/256/*.png',
-       '--error_pnorm=7',
+       '/usr/local/google/home/jyrki/newcorpus/split/*.png',
+       '--error_pnorm=3',
        '--more_columns',
-       '--adaptive_reconstruction=0',
-       '--dots=0',
-       '--noprofiler',
        '--codec', g_codecs),
       stdout=subprocess.PIPE,
       stderr=subprocess.PIPE,
@@ -134,6 +131,7 @@ def Eval(vec, binary_name, cached=True):
     sys.stdout.flush()
     if line[0:3] == "jxl":
       bpp = line.split()[3]
+      dist_max = line.split()[7]
       dist_pnorm = line.split()[8]
       dct2str = line.split()[11]
       dct4str = line.split()[12]
@@ -143,7 +141,8 @@ def Eval(vec, binary_name, cached=True):
       dct16str = line.split()[16]
       dct16x32str = line.split()[17]
       dct32str = line.split()[18]
-      vec[0] *= float(dist_pnorm) * float(bpp) / 16.0;
+      vec[0] *= float(dist_pnorm) * float(bpp) / 16.0
+      #vec[0] *= (float(dist_max) * float(bpp) / 16.0) ** 0.02
       dct2 += float(dct2str)
       dct4 += float(dct4str)
       dct16 += float(dct16str)
@@ -151,8 +150,8 @@ def Eval(vec, binary_name, cached=True):
       n += 1
       found_score = True
       distance = float(line.split()[0].split('d')[-1])
-      faultybpp = 1.0 + 0.23 * ((float(bpp) * distance ** 0.675) - 1.63791422995) ** 2
-      # vec[0] *= faultybpp
+      faultybpp = 1.0 + 0.43 * ((float(bpp) * distance ** 0.74) - 1.57) ** 2
+      vec[0] *= faultybpp
 
   """
   # favor small changes

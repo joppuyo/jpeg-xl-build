@@ -13,11 +13,6 @@
 // limitations under the License.
 #include "tools/benchmark/benchmark_codec_jxl.h"
 
-#include <brunsli/brunsli_decode.h>
-#include <brunsli/brunsli_encode.h>
-#include <brunsli/jpeg_data.h>
-#include <brunsli/jpeg_data_reader.h>
-
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -26,22 +21,21 @@
 #include <utility>
 #include <vector>
 
-#include "jxl/aux_out.h"
-#include "jxl/base/data_parallel.h"
-#include "jxl/base/os_specific.h"
-#include "jxl/base/override.h"
-#include "jxl/base/padded_bytes.h"
-#include "jxl/base/span.h"
-#include "jxl/brunsli.h"
-#include "jxl/codec_in_out.h"
-#include "jxl/dec_file.h"
-#include "jxl/dec_params.h"
-#include "jxl/enc_cache.h"
-#include "jxl/enc_file.h"
-#include "jxl/enc_params.h"
-#include "jxl/extras/codec.h"
-#include "jxl/image_bundle.h"
-#include "jxl/modular/encoding/encoding.h"
+#include "lib/extras/codec.h"
+#include "lib/jxl/aux_out.h"
+#include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/base/os_specific.h"
+#include "lib/jxl/base/override.h"
+#include "lib/jxl/base/padded_bytes.h"
+#include "lib/jxl/base/span.h"
+#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/dec_file.h"
+#include "lib/jxl/dec_params.h"
+#include "lib/jxl/enc_cache.h"
+#include "lib/jxl/enc_file.h"
+#include "lib/jxl/enc_params.h"
+#include "lib/jxl/image_bundle.h"
+#include "lib/jxl/modular/encoding/encoding.h"
 #include "tools/benchmark/benchmark_file_io.h"
 #include "tools/benchmark/benchmark_stats.h"
 #include "tools/cmdline.h"
@@ -55,29 +49,6 @@ size_t OutputToBytes(void* data, const uint8_t* buf, size_t count) {
   return count;
 }
 
-// TODO(lode): This is copied from brunsli/c/enc/encode.cc, use that one, once
-// the latest version of brunsli is checked out as submodule.
-int EncodeBrunsli(size_t insize, const unsigned char* in, void* outdata,
-                  size_t (*outfun)(void* outdata, const unsigned char* buf,
-                                   size_t size)) {
-  std::vector<uint8_t> output;
-  brunsli::JPEGData jpg;
-  if (!brunsli::ReadJpeg(in, insize, brunsli::JPEG_READ_ALL, &jpg)) {
-    return 0;
-  }
-  size_t output_size = brunsli::GetMaximumBrunsliEncodedSize(jpg);
-  output.resize(output_size);
-  if (!brunsli::BrunsliEncodeJpeg(jpg, output.data(), &output_size)) {
-    return 0;
-  }
-  output.resize(output_size);
-  if (!outfun(outdata, reinterpret_cast<const unsigned char*>(output.data()),
-              output.size())) {
-    return 0;
-  }
-  return 1; /* ok */
-}
-
 struct JxlArgs {
   double xmul;
   double quant_bias;
@@ -88,10 +59,8 @@ struct JxlArgs {
   size_t progressive_dc;
 
   Override noise;
-  Override adaptive_reconstruction;
   Override dots;
   Override patches;
-  Override gaborish;
 
   std::string debug_image_dir;
 };
@@ -115,14 +84,10 @@ Status AddCommandLineOptionsJxlCodec(BenchmarkArgs* args) {
 
   args->AddOverride(&jxlargs->noise, "noise",
                     "Enable(1)/disable(0) noise generation.");
-  args->AddOverride(
-      &jxlargs->adaptive_reconstruction, "adaptive_reconstruction",
-      "Enable(1)/disable(0) adaptive reconstruction (deringing).");
   args->AddOverride(&jxlargs->dots, "dots",
                     "Enable(1)/disable(0) dots generation.");
   args->AddOverride(&jxlargs->patches, "patches",
                     "Enable(1)/disable(0) patch dictionary.");
-  args->AddOverride(&jxlargs->gaborish, "gaborish", "Disable gaborish if 0.");
 
   args->AddString(
       &jxlargs->debug_image_dir, "debug_image_dir",
@@ -141,14 +106,16 @@ class JxlCodec : public ImageCodec {
   Status ParseParam(const std::string& param) override {
     const std::string kMaxPassesPrefix = "max_passes=";
     const std::string kDownsamplingPrefix = "downsampling=";
+    const std::string kResamplingPrefix = "resampling=";
 
-    if (ImageCodec::ParseParam(param)) {
+    if (param.substr(0, kResamplingPrefix.size()) == kResamplingPrefix) {
+      std::istringstream parser(param.substr(kResamplingPrefix.size()));
+      parser >> cparams_.resampling;
+    } else if (ImageCodec::ParseParam(param)) {
       // Nothing to do.
     } else if (param[0] == 'u') {
       cparams_.uniform_quant = strtof(param.substr(1).c_str(), nullptr);
       ba_params_.hf_asymmetry = args_.ba_params.hf_asymmetry;
-    } else if (param[0] == 'Q') {
-      brunsli_params_.quant_scale = strtof(param.substr(1).c_str(), nullptr);
     } else if (param.substr(0, kMaxPassesPrefix.size()) == kMaxPassesPrefix) {
       std::istringstream parser(param.substr(kMaxPassesPrefix.size()));
       parser >> dparams_.max_passes;
@@ -171,6 +138,8 @@ class JxlCodec : public ImageCodec {
           strtol(param.substr(1).c_str(), nullptr, 10);
     } else if (param[0] == 'p') {
       cparams_.palette_colors = strtol(param.substr(1).c_str(), nullptr, 10);
+    } else if (param == "lp") {
+      cparams_.lossy_palette = true;
     } else if (param[0] == 'N') {
       cparams_.near_lossless = strtol(param.substr(1).c_str(), nullptr, 10);
     } else if (param[0] == 'C') {
@@ -178,10 +147,9 @@ class JxlCodec : public ImageCodec {
     } else if (param[0] == 'c') {
       cparams_.color_transform =
           (jxl::ColorTransform)strtol(param.substr(1).c_str(), nullptr, 10);
+      has_ctransform_ = true;
     } else if (param[0] == 'I') {
       cparams_.options.nb_repeats = strtof(param.substr(1).c_str(), nullptr);
-    } else if (param == "Brotli") {
-      cparams_.options.entropy_coder = ModularOptions::kBrotli;
     } else if (param[0] == 'E') {
       cparams_.options.max_properties =
           strtof(param.substr(1).c_str(), nullptr);
@@ -192,15 +160,26 @@ class JxlCodec : public ImageCodec {
       cparams_.options.nb_repeats = 2;
     } else if (param == "R") {
       cparams_.responsive = 1;
-    } else if (param == "mg") {
-      cparams_.modular_group_mode = true;
+    } else if (param[0] == 'R') {
+      cparams_.responsive = strtol(param.substr(1).c_str(), nullptr, 10);
+    } else if (param == "m") {
+      cparams_.modular_mode = true;
       cparams_.color_transform = jxl::ColorTransform::kNone;
-    } else if (param == "bg") {
-      cparams_.brunsli_group_mode = true;
-      cparams_.color_transform = jxl::ColorTransform::kYCbCr;
+    } else if (param.substr(0, 3) == "gab") {
+      long gab = strtol(param.substr(3).c_str(), nullptr, 10);
+      if (gab != 0 && gab != 1) {
+        return JXL_FAILURE("Invalid gab value");
+      }
+      cparams_.gaborish = static_cast<Override>(gab);
+    } else if (param[0] == 'g') {
+      long gsize = strtol(param.substr(1).c_str(), nullptr, 10);
+      if (gsize < 0 || gsize > 3) {
+        return JXL_FAILURE("Invalid group size shift value");
+      }
+      cparams_.modular_group_size_shift = gsize;
+    } else if (param == "new_heuristics") {
+      cparams_.use_new_heuristics = true;
     } else if (param == "plt") {
-      cparams_.options.entropy_coder = ModularOptions::kBrotli;
-      cparams_.options.brotli_effort = 11;
       cparams_.options.max_properties = 0;
       cparams_.options.nb_repeats = 0;
       cparams_.options.predictor = Predictor::Zero;
@@ -208,10 +187,11 @@ class JxlCodec : public ImageCodec {
       cparams_.colorspace = 0;
       cparams_.channel_colors_pre_transform_percent = 0;
       cparams_.channel_colors_percent = 0;
-    } else if (param == "b") {
-      brunsli_mode_ = true;
-    } else if (param == "file") {
-      brunsli_file_ = true;  // Use jxl:b:file
+    } else if (param.substr(0, 3) == "epf") {
+      cparams_.epf = strtol(param.substr(3).c_str(), nullptr, 10);
+      if (cparams_.epf > 3) {
+        return JXL_FAILURE("Invalid epf value");
+      }
     } else {
       return JXL_FAILURE("Unrecognized param");
     }
@@ -220,47 +200,19 @@ class JxlCodec : public ImageCodec {
 
   bool IsColorAware() const override {
     // Can't deal with negative values from color space conversion.
-    if (cparams_.brunsli_group_mode || cparams_.modular_group_mode)
-      return false;
+    if (cparams_.modular_mode) return false;
     // Otherwise, input may be in any color space.
     return true;
   }
 
   bool IsJpegTranscoder() const override {
-    if (cparams_.brunsli_group_mode) return true;
+    // TODO(veluca): figure out when to turn this on.
     return false;
   }
 
   Status Compress(const std::string& filename, const CodecInOut* io,
                   ThreadPool* pool, PaddedBytes* compressed,
                   jpegxl::tools::SpeedStats* speed_stats) override {
-    if (brunsli_mode_) {
-      if (brunsli_file_) {
-        // Encode the original JPG file (or get failure if it was not JPG),
-        // rather than the CodecInOut pixels.
-        PaddedBytes bytes;
-        JXL_RETURN_IF_ERROR(ReadFile(filename, &bytes));
-        const double start = Now();
-        if (!EncodeBrunsli(bytes.size(), bytes.data(), compressed,
-                           OutputToBytes)) {
-          return JXL_FAILURE("Failed to encode file to brunsli");
-        }
-        const double end = Now();
-        speed_stats->NotifyElapsed(end - start);
-        return true;
-      } else {
-        if (io->metadata.HasAlpha()) {
-          // Prevent Abort in ImageBundle::VerifyMetadata when decompressing.
-          return JXL_FAILURE("Alpha not supported for brunsli");
-        }
-        const double start = Now();
-        JXL_RETURN_IF_ERROR(
-            PixelsToBrunsli(io, compressed, brunsli_params_, pool));
-        const double end = Now();
-        speed_stats->NotifyElapsed(end - start);
-        return true;
-      }
-    }
     if (!jxlargs->debug_image_dir.empty()) {
       cinfo_.dump_image = [](const CodecInOut& io, const std::string& path) {
         return EncodeToFile(io, path);
@@ -281,8 +233,6 @@ class JxlCodec : public ImageCodec {
     cparams_.progressive_dc = jxlargs->progressive_dc;
 
     cparams_.noise = jxlargs->noise;
-    cparams_.adaptive_reconstruction = jxlargs->adaptive_reconstruction;
-    cparams_.gaborish = jxlargs->gaborish;
 
     cparams_.quant_border_bias = static_cast<float>(jxlargs->quant_bias);
     cparams_.ba_params.hf_asymmetry = ba_params_.hf_asymmetry;
@@ -290,9 +240,17 @@ class JxlCodec : public ImageCodec {
 
     cparams_.quality_pair.first = q_target_;
     cparams_.quality_pair.second = q_target_;
+    if (q_target_ != 100 && cparams_.color_transform == ColorTransform::kNone &&
+        cparams_.modular_mode && !has_ctransform_) {
+      cparams_.color_transform = ColorTransform::kXYB;
+    }
 
     const double start = Now();
     PassesEncoderState passes_encoder_state;
+    if (cparams_.use_new_heuristics) {
+      passes_encoder_state.heuristics =
+          jxl::make_unique<jxl::FastEncoderHeuristics>();
+    }
     JXL_RETURN_IF_ERROR(EncodeFile(cparams_, io, &passes_encoder_state,
                                    compressed, &cinfo_, pool));
     const double end = Now();
@@ -313,8 +271,6 @@ class JxlCodec : public ImageCodec {
           ".jxl:" + params_ + ".dbg/";
       JXL_RETURN_IF_ERROR(MakeDir(dinfo_.debug_prefix));
     }
-    dparams_.noise = jxlargs->noise;
-    dparams_.adaptive_reconstruction = jxlargs->adaptive_reconstruction;
     const double start = Now();
     JXL_RETURN_IF_ERROR(DecodeFile(dparams_, compressed, io, &dinfo_, pool));
     const double end = Now();
@@ -333,10 +289,8 @@ class JxlCodec : public ImageCodec {
   AuxOut cinfo_;
   AuxOut dinfo_;
   CompressParams cparams_;
+  bool has_ctransform_ = false;
   DecompressParams dparams_;
-  BrunsliEncoderOptions brunsli_params_;
-  bool brunsli_mode_{false};
-  bool brunsli_file_{false};  // Brunsli on original JPG file instead of pixels
 };
 
 ImageCodec* CreateNewJxlCodec(const BenchmarkArgs& args) {

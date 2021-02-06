@@ -19,10 +19,10 @@
 #undef MIN
 #undef CLAMP
 
-#include "jxl/alpha.h"
-#include "jxl/base/file_io.h"
-#include "jxl/base/thread_pool_internal.h"
-#include "jxl/enc_file.h"
+#include "lib/jxl/alpha.h"
+#include "lib/jxl/base/file_io.h"
+#include "lib/jxl/base/thread_pool_internal.h"
+#include "lib/jxl/enc_file.h"
 #include "plugins/gimp/common.h"
 
 namespace jxl {
@@ -33,12 +33,11 @@ template <bool has_alpha, size_t alpha_bits = 16>
 Status ReadBuffer(const size_t xsize, const size_t ysize,
                   const std::vector<float>& pixel_data, PaddedBytes icc,
                   CodecInOut* const io) {
-  constexpr float alpha_multiplier =
-      has_alpha ? MaxAlpha(alpha_bits) / 255.f : 0.f;
+  constexpr float alpha_multiplier = has_alpha ? 1.f / 255 : 0.f;
   Image3F image(xsize, ysize);
-  ImageU alpha;
+  ImageF alpha;
   if (has_alpha) {
-    alpha = ImageU(xsize, ysize);
+    alpha = ImageF(xsize, ysize);
   }
   const float* current_sample = pixel_data.data();
   for (size_t y = 0; y < ysize; ++y) {
@@ -46,27 +45,26 @@ Status ReadBuffer(const size_t xsize, const size_t ysize,
     for (size_t c = 0; c < 3; ++c) {
       rows[c] = image.PlaneRow(c, y);
     }
-    uint16_t* const alpha_row = has_alpha ? alpha.Row(y) : nullptr;
+    float* const alpha_row = has_alpha ? alpha.Row(y) : nullptr;
     for (size_t x = 0; x < xsize; ++x) {
       for (float* const row : rows) {
         row[x] = BufferFormat<GIMP_PRECISION_FLOAT_GAMMA>::ToFloat(
             *current_sample++);
       }
       if (has_alpha) {
-        alpha_row[x] = static_cast<uint16_t>(
-            std::round(alpha_multiplier *
+        alpha_row[x] = alpha_multiplier *
                        BufferFormat<GIMP_PRECISION_FLOAT_GAMMA>::ToFloat(
-                           *current_sample++)));
+                           *current_sample++);
       }
     }
   }
 
   ColorEncoding color_encoding;
   JXL_RETURN_IF_ERROR(color_encoding.SetICC(std::move(icc)));
-  io->metadata.color_encoding = color_encoding;
+  io->metadata.m.color_encoding = color_encoding;
   io->SetFromImage(std::move(image), color_encoding);
   if (has_alpha) {
-    io->metadata.SetAlphaBits(alpha_bits);
+    io->metadata.m.SetAlphaBits(alpha_bits);
     io->Main().SetAlpha(std::move(alpha), /*alpha_is_premultiplied=*/false);
   }
   return true;
@@ -106,18 +104,18 @@ Status SaveJpegXlImage(const gint32 image_id, const gint32 drawable_id,
   // from gegl_buffer_get_format instead?
   GimpPrecision precision = gimp_image_get_precision(image_id);
   if (precision == GIMP_PRECISION_HALF_GAMMA) {
-    io.metadata.bit_depth.bits_per_sample = 16;
-    io.metadata.bit_depth.exponent_bits_per_sample = 5;
+    io.metadata.m.bit_depth.bits_per_sample = 16;
+    io.metadata.m.bit_depth.exponent_bits_per_sample = 5;
   } else if (precision == GIMP_PRECISION_FLOAT_GAMMA) {
-    io.metadata.SetFloat32Samples();
+    io.metadata.m.SetFloat32Samples();
   } else {  // unsigned integer
     // TODO(lode): handle GIMP_PRECISION_DOUBLE_GAMMA. 64-bit per channel is not
-    // supported by io.metadata.
+    // supported by io.metadata.m.
     const Babl* native_format = gegl_buffer_get_format(gegl_buffer);
     uint32_t bits_per_sample = 8 *
                                babl_format_get_bytes_per_pixel(native_format) /
                                babl_format_get_n_components(native_format);
-    io.metadata.SetUintSamples(bits_per_sample);
+    io.metadata.m.SetUintSamples(bits_per_sample);
   }
 
   const GeglRectangle rect = *gegl_buffer_get_extent(gegl_buffer);

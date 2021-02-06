@@ -28,16 +28,21 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 
 add_executable(viewer WIN32
-  load_jpegxl.cc
-  load_jpegxl.h
+  load_jxl.cc
+  load_jxl.h
   main.cc
   viewer_window.cc
   viewer_window.h
   viewer_window.ui
 )
+target_include_directories(viewer PRIVATE
+  $<TARGET_PROPERTY:lcms2,INCLUDE_DIRECTORIES>
+  "${PROJECT_SOURCE_DIR}"
+)
 target_link_libraries(viewer
-  jpegxl
-  jpegxl_threads
   Qt5::Widgets
   icc_detect
+  jxl
+  jxl_threads
+  lcms2
 )

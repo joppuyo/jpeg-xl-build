@@ -21,20 +21,37 @@
 #include <string>
 #include <vector>
 
-#include "jxl/base/compiler_specific.h"
-#include "jxl/base/data_parallel.h"
-#include "jxl/base/os_specific.h"
-#include "jxl/base/padded_bytes.h"
-#include "jxl/base/span.h"
-#include "jxl/codec_in_out.h"
-#include "jxl/image.h"
-#include "jxl/image_bundle.h"
+#include "lib/jxl/base/compiler_specific.h"
+#include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/base/os_specific.h"
+#include "lib/jxl/base/padded_bytes.h"
+#include "lib/jxl/base/span.h"
+#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/external_image.h"
+#include "lib/jxl/image.h"
+#include "lib/jxl/image_bundle.h"
 
 #ifdef MEMORY_SANITIZER
 #include "sanitizer/msan_interface.h"
 #endif
 
 namespace jxl {
+
+// Sets image data from 8-bit sRGB pixel array in bytes.
+// Amount of input bytes per pixel must be:
+// (is_gray ? 1 : 3) + (has_alpha ? 1 : 0)
+Status FromSRGB(const size_t xsize, const size_t ysize, const bool is_gray,
+                const bool has_alpha, const bool alpha_is_premultiplied,
+                const bool is_16bit, const JxlEndianness endianness,
+                const uint8_t* pixels, const uint8_t* end, ThreadPool* pool,
+                ImageBundle* ib) {
+  const ColorEncoding& c = ColorEncoding::SRGB(is_gray);
+  const size_t bits_per_sample = (is_16bit ? 2 : 1) * kBitsPerByte;
+  const Span<const uint8_t> span(pixels, end - pixels);
+  return ConvertImage(span, xsize, ysize, c, has_alpha, alpha_is_premultiplied,
+                      bits_per_sample, endianness, /*flipped_y=*/false, pool,
+                      ib);
+}
 
 struct WebPArgs {
   // Empty, no WebP-specific args currently.
@@ -80,7 +97,7 @@ class WebPCodec : public ImageCodec {
     const double start = Now();
     const ImageBundle& ib = io->Main();
 
-    const ImageU* alpha = ib.HasAlpha() ? &ib.alpha() : nullptr;
+    const ImageF* alpha = ib.HasAlpha() ? &ib.alpha() : nullptr;
     if (ib.HasAlpha() && ib.metadata()->GetAlphaBits() > 8) {
       return JXL_FAILURE("WebP alpha must be 8-bit");
     }
@@ -170,21 +187,21 @@ class WebPCodec : public ImageCodec {
     // with msan.
     __msan_unpoison(data_begin, data_end - data_begin);
 #endif
-    if (io->metadata.color_encoding.IsGray() != is_gray) {
+    if (io->metadata.m.color_encoding.IsGray() != is_gray) {
       // TODO(lode): either ensure is_gray matches what the color profile says,
       // or set a correct color profile, e.g.
-      // io->metadata.color_encoding = ColorEncoding::SRGB(is_gray);
+      // io->metadata.m.color_encoding = ColorEncoding::SRGB(is_gray);
       // Return a standard failure becuase SetFromSRGB triggers a fatal assert
       // for this instead.
       return JXL_FAILURE("Color profile is-gray mismatch");
     }
-    io->metadata.SetAlphaBits(8);
-    const Status ok = io->Main().SetFromSRGB(
-        buf->width, buf->height, is_gray, has_alpha,
-        /*alpha_is_premultiplied=*/false, data_begin, data_end, pool);
+    io->metadata.m.SetAlphaBits(8);
+    const Status ok =
+        FromSRGB(buf->width, buf->height, is_gray, has_alpha,
+                 /*alpha_is_premultiplied=*/false, /*is_16bit=*/false,
+                 JXL_LITTLE_ENDIAN, data_begin, data_end, pool, &io->Main());
     WebPFreeDecBuffer(buf);
     JXL_RETURN_IF_ERROR(ok);
-    io->enc_size = compressed.size();
     io->dec_pixels = buf->width * buf->height;
     return true;
   }
@@ -219,7 +236,7 @@ class WebPCodec : public ImageCodec {
     WebPPictureImportRGB(pic, &rgb[0], 3 * srgb.xsize());
   }
 
-  static void Import(const Image3B& srgb, const ImageU& alpha,
+  static void Import(const Image3B& srgb, const ImageF& alpha,
                      WebPPicture* pic) {
     const size_t xsize = srgb.xsize();
     const size_t ysize = srgb.ysize();
@@ -228,19 +245,19 @@ class WebPCodec : public ImageCodec {
       const uint8_t* JXL_RESTRICT row0 = srgb.ConstPlaneRow(0, y);
       const uint8_t* JXL_RESTRICT row1 = srgb.ConstPlaneRow(1, y);
       const uint8_t* JXL_RESTRICT row2 = srgb.ConstPlaneRow(2, y);
-      const uint16_t* JXL_RESTRICT rowa = alpha.ConstRow(y);
+      const float* JXL_RESTRICT rowa = alpha.ConstRow(y);
       uint8_t* const JXL_RESTRICT row_rgba = &rgba[y * xsize * 4];
       for (size_t x = 0; x < xsize; ++x) {
         row_rgba[4 * x + 0] = row0[x];
         row_rgba[4 * x + 1] = row1[x];
         row_rgba[4 * x + 2] = row2[x];
-        row_rgba[4 * x + 3] = rowa[x] & 0xFF;
+        row_rgba[4 * x + 3] = rowa[x] * 255 + .5f;
       }
     }
     WebPPictureImportRGBA(pic, &rgba[0], 4 * srgb.xsize());
   }
 
-  Status CompressInternal(const Image3B& srgb, const ImageU* alpha, int quality,
+  Status CompressInternal(const Image3B& srgb, const ImageF* alpha, int quality,
                           PaddedBytes* compressed) {
     *compressed = PaddedBytes();
     WebPConfig config;

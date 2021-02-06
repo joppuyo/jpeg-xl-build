@@ -31,17 +31,17 @@
 #include <random>
 #include <vector>
 
-#include "jxl/aux_out.h"
-#include "jxl/base/data_parallel.h"
-#include "jxl/base/file_io.h"
-#include "jxl/base/span.h"
-#include "jxl/base/thread_pool_internal.h"
-#include "jxl/codec_in_out.h"
-#include "jxl/enc_cache.h"
-#include "jxl/enc_file.h"
-#include "jxl/enc_params.h"
-#include "jxl/external_image.h"
-#include "jxl/modular/encoding/context_predict.h"
+#include "lib/jxl/aux_out.h"
+#include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/base/file_io.h"
+#include "lib/jxl/base/span.h"
+#include "lib/jxl/base/thread_pool_internal.h"
+#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/enc_cache.h"
+#include "lib/jxl/enc_file.h"
+#include "lib/jxl/enc_params.h"
+#include "lib/jxl/external_image.h"
+#include "lib/jxl/modular/encoding/context_predict.h"
 
 namespace {
 
@@ -77,7 +77,7 @@ struct ImageSpec {
       << ") x frames=" << spec.num_frames << " seed=" << spec.seed
       << ", speed=" << static_cast<int>(spec.params.speed_tier)
       << ", butteraugli=" << spec.params.butteraugli_distance
-      << ", modular_group_mode=" << spec.params.modular_group_mode << ">";
+      << ", modular_mode=" << spec.params.modular_mode << ">";
     return o;
   }
 
@@ -108,10 +108,11 @@ struct ImageSpec {
   // Flags used for compression. These are mapped to the CompressedParams.
   struct CjxlParams {
     float butteraugli_distance = 1.f;
-    jxl::Predictor modular_predictor = jxl::Predictor::Weighted;
+    // Must not use Weighted - see force_no_wp
+    jxl::Predictor modular_predictor = jxl::Predictor::Gradient;
     jxl::ColorTransform color_transform = jxl::ColorTransform::kXYB;
     jxl::SpeedTier speed_tier = jxl::SpeedTier::kTortoise;
-    bool modular_group_mode = false;
+    bool modular_mode = false;
     uint8_t padding_[3] = {};
   } params;
 };
@@ -146,11 +147,11 @@ bool GenerateFile(const char* output_dir, const ImageSpec& spec,
 
   jxl::CodecInOut io;
   if (spec.bit_depth == 32) {
-    io.metadata.SetFloat32Samples();
+    io.metadata.m.SetFloat32Samples();
   } else {
-    io.metadata.SetUintSamples(spec.bit_depth);
+    io.metadata.m.SetUintSamples(spec.bit_depth);
   }
-  io.metadata.SetAlphaBits(spec.alpha_bit_depth);
+  io.metadata.m.SetAlphaBits(spec.alpha_bit_depth, spec.alpha_is_premultiplied);
   io.dec_pixels = spec.width * spec.height;
   io.frames.clear();
   io.frames.reserve(spec.num_frames);
@@ -167,18 +168,15 @@ bool GenerateFile(const char* output_dir, const ImageSpec& spec,
   PixelGenerator gen = [&]() -> uint8_t { return dis(mt); };
 
   for (uint32_t frame = 0; frame < spec.num_frames; frame++) {
-    jxl::ImageBundle ib(&io.metadata);
-    const jxl::PackedImage desc(
-        spec.width, spec.height, io.metadata.color_encoding,
-        /*has_alpha=*/spec.alpha_bit_depth != 0,
-        /*alpha_is_premultiplied=*/spec.alpha_is_premultiplied,
-        io.metadata.GetAlphaBits(), io.metadata.bit_depth.bits_per_sample,
-        false /* big_endian */, false /* flipped_y */);
-
-    size_t bytes_per_pixel = desc.row_size / desc.xsize;
-    std::vector<uint8_t> img_data(desc.row_size * desc.ysize, 0);
+    jxl::ImageBundle ib(&io.metadata.m);
+    const bool has_alpha = spec.alpha_bit_depth != 0;
+    size_t row_size = jxl::RowSize(
+        spec.width, io.metadata.m.color_encoding.Channels() + has_alpha,
+        io.metadata.m.bit_depth.bits_per_sample);
+    size_t bytes_per_pixel = row_size / spec.width;
+    std::vector<uint8_t> img_data(row_size * spec.height, 0);
     for (size_t y = 0; y < spec.height; y++) {
-      size_t pos = desc.row_size * y;
+      size_t pos = row_size * y;
       for (size_t x = 0; x < spec.width; x++) {
         for (size_t b = 0; b < bytes_per_pixel; b++) {
           img_data[pos++] = gen();
@@ -187,15 +185,18 @@ bool GenerateFile(const char* output_dir, const ImageSpec& spec,
     }
 
     const jxl::Span<const uint8_t> span(img_data.data(), img_data.size());
-    if (!CopyTo(desc, span, nullptr, &ib)) {
-      return false;
-    }
+    JXL_RETURN_IF_ERROR(ConvertImage(
+        span, spec.width, spec.height, io.metadata.m.color_encoding,
+        /*has_alpha=*/has_alpha,
+        /*alpha_is_premultiplied=*/spec.alpha_is_premultiplied,
+        io.metadata.m.bit_depth.bits_per_sample, JXL_LITTLE_ENDIAN,
+        false /* flipped_y */, nullptr, &ib));
     io.frames.push_back(std::move(ib));
   }
 
   jxl::CompressParams params;
   params.speed_tier = spec.params.speed_tier;
-  params.modular_group_mode = spec.params.modular_group_mode;
+  params.modular_mode = spec.params.modular_mode;
   params.color_transform = spec.params.color_transform;
   params.butteraugli_distance = spec.params.butteraugli_distance;
   params.options.predictor = {spec.params.modular_predictor};
@@ -231,7 +232,7 @@ std::vector<ImageSpec::CjxlParams> CompressParamsList() {
   {
     // Lossless
     ImageSpec::CjxlParams params;
-    params.modular_group_mode = true;
+    params.modular_mode = true;
     params.color_transform = jxl::ColorTransform::kNone;
     params.modular_predictor = {jxl::Predictor::Weighted};
     ret.push_back(params);
@@ -242,28 +243,41 @@ std::vector<ImageSpec::CjxlParams> CompressParamsList() {
 
 void Usage() {
   fprintf(stderr,
-          "Use: fuzzer_corpus [-r] [output_dir]\n"
+          "Use: fuzzer_corpus [-r] [-j THREADS] [output_dir]\n"
           "\n"
-          "  -r Regenerate files if already exist.\n");
+          "  -r Regenerate files if already exist.\n"
+          "  -j THREADS Number of parallel jobs to run.\n");
 }
 
 }  // namespace
 
 int main(int argc, const char** argv) {
-  const char* dest_dir = "corpus";
+  const char* dest_dir = nullptr;
   bool regenerate = false;
-  int optind = 1;
-  if (optind < argc && !strcmp(argv[optind], "-r")) {
-    regenerate = true;
-    optind++;
+  int num_threads = std::thread::hardware_concurrency();
+  for (int optind = 1; optind < argc;) {
+    if (!strcmp(argv[optind], "-r")) {
+      regenerate = true;
+      optind++;
+    } else if (!strcmp(argv[optind], "-j")) {
+      optind++;
+      if (optind < argc) {
+        num_threads = atoi(argv[optind++]);
+      } else {
+        fprintf(stderr, "-j needs an argument value.\n");
+        Usage();
+        return 1;
+      }
+    } else if (dest_dir == nullptr) {
+      dest_dir = argv[optind++];
+    } else {
+      fprintf(stderr, "Unknown parameter: \"%s\".\n", argv[optind]);
+      Usage();
+      return 1;
+    }
   }
-  if (optind < argc) {
-    dest_dir = argv[optind++];
-  }
-  if (optind < argc) {
-    fprintf(stderr, "Unknown parameter: \"%s\".\n", argv[optind]);
-    Usage();
-    return 1;
+  if (!dest_dir) {
+    dest_dir = "corpus";
   }
 
   struct stat st;
@@ -336,7 +350,7 @@ int main(int argc, const char** argv) {
     }
   }
 
-  jxl::ThreadPoolInternal pool;
+  jxl::ThreadPoolInternal pool{num_threads};
   pool.Run(
       0, specs.size(), jxl::ThreadPool::SkipInit(),
       [&specs, dest_dir, regenerate](const int task, const int /* thread */) {

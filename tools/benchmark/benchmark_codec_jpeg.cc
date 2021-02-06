@@ -23,12 +23,12 @@
 #include <numeric>  // partial_sum
 #include <string>
 
-#include "jxl/base/data_parallel.h"
-#include "jxl/base/os_specific.h"
-#include "jxl/base/padded_bytes.h"
-#include "jxl/base/span.h"
-#include "jxl/codec_in_out.h"
-#include "jxl/extras/codec_jpg.h"
+#include "lib/extras/codec_jpg.h"
+#include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/base/os_specific.h"
+#include "lib/jxl/base/padded_bytes.h"
+#include "lib/jxl/base/span.h"
+#include "lib/jxl/codec_in_out.h"
 #include "tools/cmdline.h"
 
 #ifdef MEMORY_SANITIZER
@@ -41,43 +41,27 @@ namespace {
 
 struct JPEGArgs {
   JpegEncoder encoder = JpegEncoder::kLibJpeg;
-  YCbCrChromaSubsampling chroma_subsampling = YCbCrChromaSubsampling::kAuto;
+  YCbCrChromaSubsampling chroma_subsampling;
 };
 
 JPEGArgs* const jpegargs = new JPEGArgs;
 
 bool ParseChromaSubsampling(const char* param,
                             YCbCrChromaSubsampling* subsampling) {
-  if (strlen(param) != 3) return false;
-  if (param[0] != '4') return false;
-  switch (param[1]) {
-    case '4':
-      if (param[2] != '4') return false;
-      *subsampling = YCbCrChromaSubsampling::k444;
+  std::vector<std::pair<
+      std::string, std::pair<std::array<uint8_t, 3>, std::array<uint8_t, 3>>>>
+      options = {{"444", {{1, 1, 1}, {1, 1, 1}}},
+                 {"420", {{2, 1, 1}, {2, 1, 1}}},
+                 {"422", {{2, 1, 1}, {1, 1, 1}}},
+                 {"440", {{1, 1, 1}, {2, 1, 1}}}};
+  for (const auto& option : options) {
+    if (param == option.first) {
+      JXL_CHECK(subsampling->Set(option.second.first.data(),
+                                 option.second.second.data()));
       return true;
-
-    case '2':
-      switch (param[2]) {
-        case '2':
-          *subsampling = YCbCrChromaSubsampling::k422;
-          return true;
-
-        case '0':
-          *subsampling = YCbCrChromaSubsampling::k420;
-          return true;
-
-        default:
-          return false;
-      }
-
-    case '1':
-      if (param[2] != '1') return false;
-      *subsampling = YCbCrChromaSubsampling::k411;
-      return true;
-
-    default:
-      return false;
+    }
   }
+  return false;
 }
 
 }  // namespace
@@ -115,14 +99,7 @@ class JPEGCodec : public ImageCodec {
   Status Compress(const std::string& filename, const CodecInOut* io,
                   ThreadPool* pool, PaddedBytes* compressed,
                   jpegxl::tools::SpeedStats* speed_stats) override {
-    if (encoder_ == JpegEncoder::kLibJpeg &&
-        chroma_subsampling_ == YCbCrChromaSubsampling::kAuto) {
-      if (jpegargs->chroma_subsampling != YCbCrChromaSubsampling::kAuto) {
-        chroma_subsampling_ = jpegargs->chroma_subsampling;
-      } else {
-        chroma_subsampling_ = YCbCrChromaSubsampling::k444;
-      }
-    }
+    chroma_subsampling_ = jpegargs->chroma_subsampling;
     const double start = Now();
     JXL_RETURN_IF_ERROR(EncodeImageJPG(io, encoder_,
                                        static_cast<int>(std::round(q_target_)),

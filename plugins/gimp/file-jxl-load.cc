@@ -19,10 +19,10 @@
 #undef MIN
 #undef CLAMP
 
-#include "jxl/alpha.h"
-#include "jxl/base/file_io.h"
-#include "jxl/base/thread_pool_internal.h"
-#include "jxl/dec_file.h"
+#include "lib/jxl/alpha.h"
+#include "lib/jxl/base/file_io.h"
+#include "lib/jxl/base/thread_pool_internal.h"
+#include "lib/jxl/dec_file.h"
 #include "plugins/gimp/common.h"
 
 namespace jxl {
@@ -34,24 +34,22 @@ void FillBuffer(
     const CodecInOut& io,
     std::vector<typename BufferFormat<precision>::Sample>* const pixel_data) {
   pixel_data->reserve(io.xsize() * io.ysize() * (num_channels + has_alpha));
-  const float alpha_normalizer =
-      has_alpha ? 1.f / MaxAlpha(io.metadata.GetAlphaBits()) : 0.f;
   for (size_t y = 0; y < io.ysize(); ++y) {
     const float* rows[num_channels];
     for (size_t c = 0; c < num_channels; ++c) {
       rows[c] = io.Main().color().ConstPlaneRow(c, y);
     }
-    const uint16_t* const alpha_row =
+    const float* const alpha_row =
         has_alpha ? io.Main().alpha().ConstRow(y) : nullptr;
     for (size_t x = 0; x < io.xsize(); ++x) {
-      const float alpha = has_alpha ? alpha_row[x] * alpha_normalizer : 1.f;
+      const float alpha = has_alpha ? alpha_row[x] : 1.f;
       const float alpha_multiplier =
           has_alpha && io.Main().AlphaIsPremultiplied()
               ? 1.f / std::max(kSmallAlpha, alpha)
               : 1.f;
       for (const float* const row : rows) {
         pixel_data->push_back(BufferFormat<precision>::FromFloat(
-            std::max(0.f, std::min(255.f, alpha_multiplier * row[x]))));
+            std::max(0.f, std::min(1.f, alpha_multiplier * row[x]))));
       }
       if (has_alpha) {
         pixel_data->push_back(
@@ -106,9 +104,9 @@ Status LoadJpegXlImage(const gchar* const filename, gint32* const image_id) {
   JXL_RETURN_IF_ERROR(
       DecodeFile(dparams, compressed, &io, /*aux_out=*/nullptr, &pool));
 
-  JXL_RETURN_IF_ERROR(io.TransformTo(io.metadata.color_encoding, &pool));
+  JXL_RETURN_IF_ERROR(io.TransformTo(io.metadata.m.color_encoding, &pool));
 
-  const PaddedBytes& icc = io.metadata.color_encoding.ICC();
+  const PaddedBytes& icc = io.metadata.m.color_encoding.ICC();
   GimpColorProfile* profile =
       gimp_color_profile_new_from_icc_profile(icc.data(), icc.size(),
                                               /*error=*/nullptr);
@@ -139,8 +137,8 @@ Status LoadJpegXlImage(const gchar* const filename, gint32* const image_id) {
 
   GimpPrecision precision;
   Status (*fill_layer)(gint32 layer, const CodecInOut& io, GimpImageType);
-  if (io.metadata.bit_depth.floating_point_sample) {
-    if (io.metadata.bit_depth.bits_per_sample <= 16) {
+  if (io.metadata.m.bit_depth.floating_point_sample) {
+    if (io.metadata.m.bit_depth.bits_per_sample <= 16) {
       precision = GIMP_PRECISION_HALF_GAMMA;
       fill_layer = &FillGimpLayer<GIMP_PRECISION_HALF_GAMMA>;
     } else {
@@ -148,10 +146,10 @@ Status LoadJpegXlImage(const gchar* const filename, gint32* const image_id) {
       fill_layer = &FillGimpLayer<GIMP_PRECISION_FLOAT_GAMMA>;
     }
   } else {
-    if (io.metadata.bit_depth.bits_per_sample <= 8) {
+    if (io.metadata.m.bit_depth.bits_per_sample <= 8) {
       precision = GIMP_PRECISION_U8_GAMMA;
       fill_layer = &FillGimpLayer<GIMP_PRECISION_U8_GAMMA>;
-    } else if (io.metadata.bit_depth.bits_per_sample <= 16) {
+    } else if (io.metadata.m.bit_depth.bits_per_sample <= 16) {
       precision = GIMP_PRECISION_U16_GAMMA;
       fill_layer = &FillGimpLayer<GIMP_PRECISION_U16_GAMMA>;
     } else {

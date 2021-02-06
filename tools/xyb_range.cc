@@ -16,14 +16,14 @@
 
 #include <utility>
 
-#include "jxl/base/compiler_specific.h"
-#include "jxl/base/data_parallel.h"
-#include "jxl/codec_in_out.h"
-#include "jxl/color_encoding.h"
-#include "jxl/color_management.h"
-#include "jxl/enc_xyb.h"
-#include "jxl/image.h"
-#include "jxl/image_bundle.h"
+#include "lib/jxl/base/compiler_specific.h"
+#include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/color_encoding_internal.h"
+#include "lib/jxl/color_management.h"
+#include "lib/jxl/enc_xyb.h"
+#include "lib/jxl/image.h"
+#include "lib/jxl/image_bundle.h"
 
 namespace jxl {
 namespace {
@@ -44,14 +44,13 @@ void PrintXybRange() {
     }
   }
   CodecInOut io;
-  io.metadata.SetUintSamples(8);
-  io.metadata.color_encoding = ColorEncoding::LinearSRGB();
-  io.SetFromImage(std::move(linear), io.metadata.color_encoding);
+  io.metadata.m.SetUintSamples(8);
+  io.metadata.m.color_encoding = ColorEncoding::LinearSRGB();
+  io.SetFromImage(std::move(linear), io.metadata.m.color_encoding);
   const ImageBundle& ib = io.Main();
   ThreadPool* null_pool = nullptr;
   Image3F opsin(ib.xsize(), ib.ysize());
-  ImageBundle unused_linear;
-  (void)ToXYB(ib, null_pool, &opsin, &unused_linear);
+  (void)ToXYB(ib, null_pool, &opsin);
   for (size_t c = 0; c < 3; ++c) {
     float minval = 1e10f;
     float maxval = -1e10f;

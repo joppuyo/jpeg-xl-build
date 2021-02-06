@@ -20,8 +20,11 @@
 #include <string>
 #include <vector>
 
-#include "jxl/base/padded_bytes.h"
-#include "jxl/base/status.h"
+#include "lib/jxl/base/padded_bytes.h"
+#include "lib/jxl/base/status.h"
+#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/dec_file.h"
+#include "lib/jxl/enc_file.h"
 
 namespace jpegxl {
 namespace tools {
@@ -68,14 +71,24 @@ struct JpegXlContainer {
   // TODO(lode): That means it first has 4 bytes exif_tiff_header_offset,
   // followed by the payload (EXIF and TIFF) in the next bytes. Offer the offset
   // adn payload as separate fields in the API here instead?
+  // TODO(lode): support the theoretical case of multiple exif boxes
   const uint8_t* exif = nullptr;  // Not owned
   size_t exif_size = 0;
+
+  // Brotli-compressed exif metadata, if present. The data points to the brotli
+  // compressed stream, it is not decompressed here.
+  const uint8_t* exfc = nullptr;  // Not owned
+  size_t exfc_size = 0;
 
   // XML boxes for XMP. There may be multiple XML boxes.
   // Each entry points to XML location and provides size.
   // The memory is not owned.
   // TODO(lode): for C API, cannot use std::vector.
   std::vector<std::pair<const uint8_t*, size_t>> xml;
+
+  // Brotli-compressed xml boxes. The bytes are given in brotli-compressed form
+  // and are not decompressed here.
+  std::vector<std::pair<const uint8_t*, size_t>> xmlc;
 
   // JUMBF superbox data, or null if not present in the container.
   // The parsing of the nested boxes inside is not handled here.
@@ -84,10 +97,19 @@ struct JpegXlContainer {
 
   // TODO(lode): add frame index data
 
+  // JPEG reconstruction data, or null if not present in the container.
+  const uint8_t* jpeg_reconstruction = nullptr;
+  size_t jpeg_reconstruction_size = 0;
+
   // The main JPEG XL codestream, of which there must be 1 in the container.
+  // TODO(lode): support split codestream: there may be multiple jxlp boxes.
   const uint8_t* codestream = nullptr;  // Not owned
   size_t codestream_size = 0;
 };
+
+// Returns whether `data` starts with a container header; definitely returns
+// false if `size` is less than 12 bytes.
+bool IsContainerHeader(const uint8_t* data, size_t size);
 
 // NOTE: the input data must remain valid as long as `container` is used,
 // because its exif etc. pointers point to that data.
@@ -97,6 +119,19 @@ jxl::Status DecodeJpegXlContainerOneShot(const uint8_t* data, size_t size,
 // TODO(lode): streaming C API
 jxl::Status EncodeJpegXlContainerOneShot(const JpegXlContainer& container,
                                          jxl::PaddedBytes* out);
+
+// TODO(veluca): this doesn't really belong here.
+jxl::Status DecodeJpegXlToJpeg(jxl::DecompressParams params,
+                               const JpegXlContainer& container,
+                               jxl::CodecInOut* io,
+                               jxl::AuxOut* aux_out = nullptr,
+                               jxl::ThreadPool* pool = nullptr);
+jxl::Status EncodeJpegToJpegXL(const jxl::CompressParams& params,
+                               const jxl::CodecInOut* io,
+                               jxl::PassesEncoderState* passes_enc_state,
+                               jxl::PaddedBytes* compressed,
+                               jxl::AuxOut* aux_out = nullptr,
+                               jxl::ThreadPool* pool = nullptr);
 
 }  // namespace tools
 }  // namespace jpegxl

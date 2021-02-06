@@ -14,7 +14,10 @@
 
 #include "tools/box/box.h"
 
-#include "jxl/base/byte_order.h"
+#include "lib/jxl/base/byte_order.h"  // for GetMaximumBrunsliEncodedSize
+#include "lib/jxl/jpeg/dec_jpeg_data.h"
+#include "lib/jxl/jpeg/enc_jpeg_data.h"
+#include "lib/jxl/jpeg/jpeg_data.h"
 
 namespace jpegxl {
 namespace tools {
@@ -122,6 +125,13 @@ jxl::Status AppendBoxHeader(const Box& box, jxl::PaddedBytes* out) {
   return true;
 }
 
+bool IsContainerHeader(const uint8_t* data, size_t size) {
+  const uint8_t box_header[] = {0,   0,   0,   0xc, 'J',  'X',
+                                'L', ' ', 0xd, 0xa, 0x87, 0xa};
+  if (size < sizeof(box_header)) return false;
+  return memcmp(box_header, data, sizeof(box_header)) == 0;
+}
+
 jxl::Status DecodeJpegXlContainerOneShot(const uint8_t* data, size_t size,
                                          JpegXlContainer* container) {
   const uint8_t* in = data;
@@ -129,11 +139,16 @@ jxl::Status DecodeJpegXlContainerOneShot(const uint8_t* data, size_t size,
 
   container->exif = nullptr;
   container->exif_size = 0;
+  container->exfc = nullptr;
+  container->exfc_size = 0;
   container->xml.clear();
+  container->xmlc.clear();
   container->jumb = nullptr;
   container->jumb_size = 0;
   container->codestream = nullptr;
   container->codestream_size = 0;
+  container->jpeg_reconstruction = nullptr;
+  container->jpeg_reconstruction_size = 0;
 
   size_t box_index = 0;
 
@@ -152,7 +167,7 @@ jxl::Status DecodeJpegXlContainerOneShot(const uint8_t* data, size_t size,
     if (box_index == 0) {
       // TODO(lode): leave out magic signature box?
       // Must be magic signature box.
-      if (memcmp("JXL ", box.type, 4)) {
+      if (memcmp("JXL ", box.type, 4) != 0) {
         return JXL_FAILURE("Invalid magic signature");
       }
       if (box.data_size != 4) return JXL_FAILURE("Invalid magic signature");
@@ -161,12 +176,12 @@ jxl::Status DecodeJpegXlContainerOneShot(const uint8_t* data, size_t size,
       }
     } else if (box_index == 1) {
       // Must be ftyp box.
-      if (memcmp("ftyp", box.type, 4)) {
+      if (memcmp("ftyp", box.type, 4) != 0) {
         return JXL_FAILURE("Invalid ftyp");
       }
       if (box.data_size != 12) return JXL_FAILURE("Invalid ftyp");
       const char* expected = "jxl \0\0\0\0jxl ";
-      if (memcmp(expected, in, 12)) return JXL_FAILURE("Invalid ftyp");
+      if (memcmp(expected, in, 12) != 0) return JXL_FAILURE("Invalid ftyp");
     } else if (!memcmp("jxli", box.type, 4)) {
       // TODO(lode): parse JXL frame index box
       if (container->codestream) {
@@ -178,11 +193,19 @@ jxl::Status DecodeJpegXlContainerOneShot(const uint8_t* data, size_t size,
     } else if (!memcmp("exif", box.type, 4)) {
       container->exif = in;
       container->exif_size = data_size;
+    } else if (!memcmp("exfc", box.type, 4)) {
+      container->exfc = in;
+      container->exfc_size = data_size;
     } else if (!memcmp("xml ", box.type, 4)) {
       container->xml.emplace_back(in, data_size);
+    } else if (!memcmp("xmlc", box.type, 4)) {
+      container->xmlc.emplace_back(in, data_size);
     } else if (!memcmp("jumb", box.type, 4)) {
       container->jumb = in;
       container->jumb_size = data_size;
+    } else if (!memcmp("jbrd", box.type, 4)) {
+      container->jpeg_reconstruction = in;
+      container->jpeg_reconstruction_size = data_size;
     } else {
       // Do nothing: box not recognized here but may be recognizeable by
       // other software.
@@ -221,9 +244,25 @@ jxl::Status EncodeJpegXlContainerOneShot(const JpegXlContainer& container,
         AppendBoxAndData("exif", container.exif, container.exif_size, out));
   }
 
+  if (container.exfc) {
+    JXL_RETURN_IF_ERROR(
+        AppendBoxAndData("exfc", container.exfc, container.exfc_size, out));
+  }
+
   for (size_t i = 0; i < container.xml.size(); i++) {
     JXL_RETURN_IF_ERROR(AppendBoxAndData("xml ", container.xml[i].first,
                                          container.xml[i].second, out));
+  }
+
+  for (size_t i = 0; i < container.xmlc.size(); i++) {
+    JXL_RETURN_IF_ERROR(AppendBoxAndData("xmlc", container.xmlc[i].first,
+                                         container.xmlc[i].second, out));
+  }
+
+  if (container.jpeg_reconstruction) {
+    JXL_RETURN_IF_ERROR(AppendBoxAndData("jbrd", container.jpeg_reconstruction,
+                                         container.jpeg_reconstruction_size,
+                                         out));
   }
 
   if (container.codestream) {
@@ -239,6 +278,54 @@ jxl::Status EncodeJpegXlContainerOneShot(const JpegXlContainer& container,
   }
 
   return true;
+}
+
+// TODO(veluca): the format defined here encode some things multiple times. Fix
+// that.
+jxl::Status DecodeJpegXlToJpeg(jxl::DecompressParams params,
+                               const JpegXlContainer& container,
+                               jxl::CodecInOut* io, jxl::AuxOut* aux_out,
+                               jxl::ThreadPool* pool) {
+  params.keep_dct = true;
+  if (container.jpeg_reconstruction == nullptr) {
+    return JXL_FAILURE(
+        "Cannot decode to JPEG without a JPEG reconstruction box");
+  }
+
+  io->Main().jpeg_data = jxl::make_unique<jxl::jpeg::JPEGData>();
+
+  JXL_RETURN_IF_ERROR(DecodeJPEGData(
+      jxl::Span<const uint8_t>(container.jpeg_reconstruction,
+                               container.jpeg_reconstruction_size),
+      io->Main().jpeg_data.get()));
+
+  JXL_RETURN_IF_ERROR(DecodeFile(
+      params,
+      jxl::Span<const uint8_t>(container.codestream, container.codestream_size),
+      io, aux_out, pool));
+  return true;
+}
+jxl::Status EncodeJpegToJpegXL(const jxl::CompressParams& params,
+                               const jxl::CodecInOut* io,
+                               jxl::PassesEncoderState* passes_enc_state,
+                               jxl::PaddedBytes* compressed,
+                               jxl::AuxOut* aux_out, jxl::ThreadPool* pool) {
+  if (io->frames.size() != 1 || !io->Main().IsJPEG()) {
+    return JXL_FAILURE("Cannot transcode a non-JPEG file");
+  }
+  compressed->clear();
+  JpegXlContainer container;
+  jxl::PaddedBytes cs;
+  JXL_RETURN_IF_ERROR(
+      EncodeFile(params, io, passes_enc_state, &cs, aux_out, pool));
+  container.codestream = cs.data();
+  container.codestream_size = cs.size();
+  jxl::jpeg::JPEGData data_in = *io->Main().jpeg_data;
+  jxl::PaddedBytes jpeg_data;
+  JXL_RETURN_IF_ERROR(EncodeJPEGData(data_in, &jpeg_data));
+  container.jpeg_reconstruction = jpeg_data.data();
+  container.jpeg_reconstruction_size = jpeg_data.size();
+  return EncodeJpegXlContainerOneShot(container, compressed);
 }
 
 }  // namespace tools

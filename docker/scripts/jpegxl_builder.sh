@@ -54,6 +54,19 @@ WEBP_RELEASE="1.0.2"
 WEBP_URL="https://codeload.github.com/webmproject/libwebp/tar.gz/v${WEBP_RELEASE}"
 WEBP_SHA256="347cf85ddc3497832b5fa9eee62164a37b249c83adae0ba583093e039bf4881f"
 
+# Google benchmark
+BENCHMARK_RELEASE="1.5.2"
+BENCHMARK_URL="https://github.com/google/benchmark/archive/v${BENCHMARK_RELEASE}.tar.gz"
+BENCHMARK_SHA256="dccbdab796baa1043f04982147e67bb6e118fe610da2c65f88912d73987e700c"
+BENCHMARK_FLAGS="-DGOOGLETEST_PATH=${MYDIR}/../../third_party/googletest"
+# attribute(format(__MINGW_PRINTF_FORMAT, ...)) doesn't work in our
+# environment, so we disable the warning.
+BENCHMARK_FLAGS="-DCMAKE_BUILD_TYPE=Release -DBENCHMARK_ENABLE_TESTING=OFF \
+  -DCMAKE_CXX_FLAGS=-Wno-ignored-attributes"
+
+# V8
+V8_VERSION="8.7.230"
+
 # Temporary files cleanup hooks.
 CLEANUP_FILES=()
 cleanup() {
@@ -89,7 +102,7 @@ LIST_WASM_TARGETS=(
 # Setup the apt repositories and supported architectures.
 setup_apt() {
   apt-get update -y
-  apt-get install -y curl gnupg
+  apt-get install -y curl gnupg ca-certificates
 
   apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 1E9377A2BA9EF27F
 
@@ -150,6 +163,7 @@ install_pkgs() {
     # For cross-compiling to Windows with mingw.
     mingw-w64
     wine64
+    wine-binfmt
 
     # Native tools.
     bsdmainutils
@@ -184,6 +198,13 @@ install_pkgs() {
 
     # To generate API documentation.
     doxygen
+
+    # Freezes version that builds (passes tests). Newer version
+    # (2.30-21ubuntu1~18.04.4) claims to fix "On Intel Skylake
+    # (-march=native) generated avx512 instruction can be wrong",
+    # but newly added tests does not pass. Perhaps the problem is
+    # that mingw package is not updated.
+    binutils-source=2.30-15ubuntu1
   )
 
   # Install packages that are arch-dependent.
@@ -193,6 +214,7 @@ install_pkgs() {
       # Library dependencies. These normally depend on the target architecture
       # we are compiling for and can't usually be installed for multiple
       # architectures at the same time.
+      libgif7:"${ubarch}"
       libjpeg-dev:"${ubarch}"
       libpng-dev:"${ubarch}"
       libqt5x11extras5-dev:"${ubarch}"
@@ -226,8 +248,7 @@ install_pkgs() {
 
   # Install all the manual packages via "apt install" for the main arch. These
   # will be installed for other archs via manual download and unpack.
-  DEBIAN_FRONTEND=noninteractive apt install -y \
-    "${packages[@]}" "${UNPACK_PKGS[@]}"
+  apt install -y "${packages[@]}" "${UNPACK_PKGS[@]}"
 }
 
 # binutils <2.32 need a patch.
@@ -308,6 +329,11 @@ install_from_source() {
       # When compiling with clang, CMake doesn't detect that we are using mingw.
       cmake_args+=(
         -DMINGW=1
+        # Googletest needs this when cross-compiling to windows
+        -DCMAKE_CROSSCOMPILING=1
+        -DHAVE_STD_REGEX=0
+        -DHAVE_POSIX_REGEX=0
+        -DHAVE_GNU_POSIX_REGEX=0
       )
       local windres=$(which ${target}-windres || true)
       if [[ -n "${windres}" ]]; then
@@ -323,6 +349,10 @@ install_from_source() {
         -DCMAKE_FIND_ROOT_PATH="${prefix}"
         -DCMAKE_PREFIX_PATH="${prefix}"
       )
+      # Static and shared library link to the same file -> race condition.
+      nproc=1
+    else
+      nproc=`nproc --all`
     fi
     cmake_args+=(-DCMAKE_SYSTEM_NAME="${system_name}")
 
@@ -350,7 +380,7 @@ install_from_source() {
         ${cmake} \
           -DCMAKE_INSTALL_PREFIX="${prefix}" \
           "${cmake_args[@]}" ${pkgflags}
-        ${make} -j$(nproc --all)
+        ${make} -j${nproc}
         ${make} install
       )
     elif [[ "${package}" == "GIFLIB" ]]; then
@@ -368,8 +398,8 @@ install_from_source() {
         fi
         # giflib make dependencies are not properly set up so parallel building
         # doesn't work for everything.
-        ${make} -j$(nproc --all) libgif.a "${giflib_make_flags[@]}"
-        ${make} -j$(nproc --all) all "${giflib_make_flags[@]}"
+        ${make} -j${nproc} libgif.a "${giflib_make_flags[@]}"
+        ${make} -j${nproc} all "${giflib_make_flags[@]}"
         ${make} install "${giflib_make_flags[@]}"
       )
     else
@@ -426,6 +456,26 @@ main() {
   # which is not available in the llvm repos so it might have a different
   # version than the ubuntu ones.
 
+  # Remove the win32 libgcc version. The gcc-mingw-w64-x86-64 (and i686)
+  # packages install two libgcc versions:
+  #   /usr/lib/gcc/x86_64-w64-mingw32/7.3-posix
+  #   /usr/lib/gcc/x86_64-w64-mingw32/7.3-win32
+  # (exact libgcc version number depends on the package version).
+  #
+  # Clang will pick the best libgcc, sorting by version, but it doesn't
+  # seem to be a way to specify one or the other one, except by passing
+  # -nostdlib and setting all the include paths from the command line.
+  # To check which one is being used you can run:
+  #   clang++-7 --target=x86_64-w64-mingw32 -v -print-libgcc-file-name
+  # We need to use the "posix" versions for thread support, so here we
+  # just remove the other one.
+  local target
+  for target in "${LIST_MINGW_TARGETS[@]}"; do
+    update-alternatives --set "${target}-gcc" $(which "${target}-gcc-posix")
+    local gcc_win32_path=$("${target}-cpp-win32" -print-libgcc-file-name)
+    rm -rf $(dirname "${gcc_win32_path}")
+  done
+
   # TODO: Add msan for the target when cross-compiling. This only installs it
   # for amd64.
   ./msan_install.sh
@@ -448,16 +498,17 @@ main() {
   # webp in Ubuntu is relatively old so we install it from source for everybody.
   install_from_source WEBP "${LIST_TARGETS[@]}" "${LIST_MINGW_TARGETS[@]}"
 
+  install_from_source BENCHMARK "${LIST_TARGETS[@]}" "${LIST_MINGW_TARGETS[@]}"
+
   # Install v8. v8 has better WASM SIMD support than NodeJS 14.
-  local v8_version="8.5.133"
-  # install installer
+  # First we need the installer to install v8.
   npm install jsvu -g
   # install specific version;
-  HOME=/opt jsvu --os=linux64 "v8@${v8_version}"
-  ln -s "/opt/.jsvu/v8-${v8_version}" "/opt/.jsvu/v8"
+  HOME=/opt jsvu --os=linux64 "v8@${V8_VERSION}"
+  ln -s "/opt/.jsvu/v8-${V8_VERSION}" "/opt/.jsvu/v8"
 
   # Cleanup.
-  rm -rf /var/lib/apt/lists/*
+  find /var/lib/apt/lists/ -mindepth 1 -delete
 }
 
 main "$@"

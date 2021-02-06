@@ -22,7 +22,7 @@
 #include <QSet>
 
 #include "tools/icc_detect/icc_detect.h"
-#include "tools/viewer/load_jpegxl.h"
+#include "tools/viewer/load_jxl.h"
 
 namespace jxl {
 
@@ -73,7 +73,7 @@ void ViewerWindow::loadFilesAndDirectories(QStringList entries) {
 void ViewerWindow::on_actionOpen_triggered() {
   QFileDialog dialog(this, tr("Select JPEG XL files to open…"));
   dialog.setFileMode(QFileDialog::ExistingFiles);
-  dialog.setNameFilter(tr("JPEG XL images (*.xl);;All files (*)"));
+  dialog.setNameFilter(tr("JPEG XL images (*.jxl);;All files (*)"));
   if (dialog.exec()) {
     loadFilesAndDirectories(dialog.selectedFiles());
   }
@@ -98,8 +98,8 @@ void ViewerWindow::refreshImage() {
   qint64 elapsed_ns;
   bool usedRequestedProfile;
   const QImage image =
-      loadJpegXlImage(filenames_[currentFileIndex_], monitorProfile_,
-                      &elapsed_ns, &usedRequestedProfile);
+      loadJxlImage(filenames_[currentFileIndex_], monitorProfile_, &elapsed_ns,
+                   &usedRequestedProfile);
   if (image.isNull()) {
     const QString message =
         tr("Failed to load \"%1\".").arg(filenames_[currentFileIndex_]);

@@ -18,13 +18,13 @@
 
 #include <string>
 
-#include "jxl/base/data_parallel.h"
-#include "jxl/base/os_specific.h"
-#include "jxl/base/padded_bytes.h"
-#include "jxl/base/span.h"
-#include "jxl/codec_in_out.h"
-#include "jxl/extras/codec_png.h"
-#include "jxl/image_bundle.h"
+#include "lib/extras/codec_png.h"
+#include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/base/os_specific.h"
+#include "lib/jxl/base/padded_bytes.h"
+#include "lib/jxl/base/span.h"
+#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/image_bundle.h"
 
 namespace jxl {
 
@@ -46,7 +46,7 @@ class PNGCodec : public ImageCodec {
   Status Compress(const std::string& filename, const CodecInOut* io,
                   ThreadPool* pool, PaddedBytes* compressed,
                   jpegxl::tools::SpeedStats* speed_stats) override {
-    const size_t bits = io->metadata.bit_depth.bits_per_sample;
+    const size_t bits = io->metadata.m.bit_depth.bits_per_sample;
     const double start = Now();
     JXL_RETURN_IF_ERROR(
         EncodeImagePNG(io, io->Main().c_current(), bits, pool, compressed));

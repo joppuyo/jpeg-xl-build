@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-#include "jxl/base/status.h"
+#include "lib/jxl/base/status.h"
 
 namespace jpegxl {
 namespace tools {
@@ -109,8 +109,11 @@ class CommandLineParser {
     return options_[id].get();
   }
 
-  // Print the help message.
+  // Print the help message to stdout.
   void PrintHelp() const;
+
+  // Whether a help flag was specified
+  bool HelpFlagPassed() const { return help_; }
 
   int verbosity = 0;
 
@@ -152,9 +155,9 @@ class CommandLineParser {
       return true;
     }
 
-    virtual bool positional() const override { return true; }
+    bool positional() const override { return true; }
 
-    virtual bool required() const override { return required_; }
+    bool required() const override { return required_; }
 
    private:
     const char* name_;
@@ -251,9 +254,9 @@ class CommandLineParser {
       }
     }
 
-    virtual bool positional() const override { return false; }
+    bool positional() const override { return false; }
 
-    virtual bool required() const override {
+    bool required() const override {
       // Only used for help display of positional arguments.
       return false;
     }
@@ -314,6 +317,10 @@ class CommandLineParser {
   const char* program_name_{nullptr};
 
   std::vector<std::unique_ptr<CmdOptionInterface>> options_;
+
+  // If true, help argument was given, so print help to stdout rather than
+  // stderr.
+  bool help_ = false;
 };
 
 }  // namespace tools

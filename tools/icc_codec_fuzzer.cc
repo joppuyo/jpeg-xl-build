@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "jxl/icc_codec.h"
+#include "lib/jxl/icc_codec.h"
 
 namespace jxl {
 
@@ -30,8 +30,9 @@ int TestOneInput(const uint8_t* data, size_t size) {
 #endif
 
 #ifdef JXL_ICC_FUZZER_SLOW_TEST
-  // Including Brotli compression. Brotli is already fuzzed separately, so it is
-  // better to disable JXL_ICC_FUZZER_SLOW_TEST to focus on the ICC parsing.
+  // Including JPEG XL LZ77 and ANS compression. These are already fuzzed
+  // separately, so it is better to disable JXL_ICC_FUZZER_SLOW_TEST to focus on
+  // the ICC parsing.
   if (read) {
     // Reading parses the compressed format.
     BitReader br(Span<const uint8_t>(data, size));
@@ -44,7 +45,9 @@ int TestOneInput(const uint8_t* data, size_t size) {
     icc.assign(data, data + size);
     BitWriter writer;
     AuxOut aux;
-    (void)WriteICC(icc, &writer, 0, &aux);
+    // Writing should support any random bytestream so must succeed, make
+    // fuzzer fail if not.
+    JXL_ASSERT(WriteICC(icc, &writer, 0, &aux));
   }
 #else  // JXL_ICC_FUZZER_SLOW_TEST
   if (read) {
@@ -54,7 +57,13 @@ int TestOneInput(const uint8_t* data, size_t size) {
   } else {
     // Writing (predicting) parses the original ICC profile.
     PaddedBytes result;
-    (void)PredictICC(data, size, &result);
+    // Writing should support any random bytestream so must succeed, make
+    // fuzzer fail if not.
+    JXL_ASSERT(PredictICC(data, size, &result));
+    PaddedBytes reconstructed;
+    JXL_ASSERT(UnpredictICC(result.data(), result.size(), &reconstructed));
+    JXL_ASSERT(reconstructed.size() == size);
+    JXL_ASSERT(memcmp(data, reconstructed.data(), size) == 0);
   }
 #endif  // JXL_ICC_FUZZER_SLOW_TEST
   return 0;

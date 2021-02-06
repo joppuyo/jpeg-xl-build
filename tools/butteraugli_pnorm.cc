@@ -13,10 +13,6 @@
 // limitations under the License.
 
 #include "tools/butteraugli_pnorm.h"
-#undef HWY_TARGET_INCLUDE
-#define HWY_TARGET_INCLUDE "tools/butteraugli_pnorm.cc"
-#include "hwy/foreach_target.h"
-//
 
 #include <math.h>
 #include <stdio.h>
@@ -24,14 +20,20 @@
 
 #include <atomic>
 
-#include "jxl/base/compiler_specific.h"
-#include "jxl/base/profiler.h"
-#include "jxl/color_encoding.h"
+#undef HWY_TARGET_INCLUDE
+#define HWY_TARGET_INCLUDE "tools/butteraugli_pnorm.cc"
+#include <hwy/foreach_target.h>
+#include <hwy/highway.h>
 
-//
-#include <hwy/before_namespace-inl.h>
+#include "lib/jxl/base/compiler_specific.h"
+#include "lib/jxl/base/profiler.h"
+#include "lib/jxl/color_encoding_internal.h"
+HWY_BEFORE_NAMESPACE();
 namespace jxl {
-#include <hwy/begin_target-inl.h>
+namespace HWY_NAMESPACE {
+
+// These templates are not found via ADL.
+using hwy::HWY_NAMESPACE::Rebind;
 
 double ComputeDistanceP(const ImageF& distmap, const ButteraugliParams& params,
                         double p) {
@@ -49,16 +51,17 @@ double ComputeDistanceP(const ImageF& distmap, const ButteraugliParams& params,
   if (std::abs(p - 3.0) < 1E-6) {
     double sum1[3] = {0.0};
 
-    // Manually aligned storage to avoid asan crash on clang-7 due to
-    // unaligned spill.
-#if HWY_CAP_DOUBLE
+// Prefer double if possible, but otherwise use float rather than scalar.
+#if HWY_CAP_FLOAT64
     using T = double;
-    const HWY_CAPPED(float, MaxLanes(HWY_FULL(double)())) df;
+    const Rebind<float, HWY_FULL(double)> df;
 #else
     using T = float;
 #endif
     const HWY_FULL(T) d;
     constexpr size_t N = MaxLanes(HWY_FULL(T)());
+    // Manually aligned storage to avoid asan crash on clang-7 due to
+    // unaligned spill.
     HWY_ALIGN T sum_totals0[N] = {0};
     HWY_ALIGN T sum_totals1[N] = {0};
     HWY_ALIGN T sum_totals2[N] = {0};
@@ -72,7 +75,7 @@ double ComputeDistanceP(const ImageF& distmap, const ButteraugliParams& params,
 
       size_t x = border;
       for (; x + Lanes(d) <= distmap.xsize() - border; x += Lanes(d)) {
-#if HWY_CAP_DOUBLE
+#if HWY_CAP_FLOAT64
         const auto d1 = PromoteTo(d, Load(df, row + x));
 #else
         const auto d1 = Load(d, row + x);
@@ -156,54 +159,60 @@ double ComputeDistance2(const ImageBundle& ib1, const ImageBundle& ib2) {
 
   JXL_CHECK(SameSize(*srgb1, *srgb2));
 
-  const HWY_FULL(float) d;
-  const size_t N = Lanes(d);
-  HWY_ALIGN float sum_total[MaxLanes(d)] = {0.0f};
-
-  double result = 0;
-  // Weighted PSNR as in JPEG-XL: chroma counts 1/8 (they compute on YCbCr).
-  // Avoid squaring the weight - 1/64 is too extreme.
-  const float weights[3] = {1.0f / 8, 6.0f / 8, 1.0f / 8};
-  for (size_t c = 0; c < 3; ++c) {
-    const auto weight = Set(d, weights[c]);
-
-    for (size_t y = 0; y < srgb1->ysize(); ++y) {
-      const float* JXL_RESTRICT row1 = srgb1->ConstPlaneRow(c, y);
-      const float* JXL_RESTRICT row2 = srgb2->ConstPlaneRow(c, y);
-
-      auto sums = Zero(d);
-      size_t x = 0;
-      for (; x + N <= srgb1->xsize(); x += N) {
-        const auto diff = Load(d, row1 + x) - Load(d, row2 + x);
-        sums += diff * diff * weight;
+  // TODO(veluca): SIMD.
+  float yuvmatrix[3][3] = {{0.299, 0.587, 0.114},
+                           {-0.14713, -0.28886, 0.436},
+                           {0.615, -0.51499, -0.10001}};
+  double sum_of_squares[3] = {};
+  for (size_t y = 0; y < srgb1->ysize(); ++y) {
+    const float* JXL_RESTRICT row1[3];
+    const float* JXL_RESTRICT row2[3];
+    for (size_t j = 0; j < 3; j++) {
+      row1[j] = srgb1->ConstPlaneRow(j, y);
+      row2[j] = srgb2->ConstPlaneRow(j, y);
+    }
+    for (size_t x = 0; x < srgb1->xsize(); ++x) {
+      float cdiff[3] = {};
+      // YUV conversion is linear, so we can run it on the difference.
+      for (size_t j = 0; j < 3; j++) {
+        cdiff[j] = row1[j][x] - row2[j][x];
       }
-      // Workaround for clang-7 asan crash if sums is hoisted outside loops
-      // (unaligned spill).
-      Store(sums + Load(d, sum_total), d, sum_total);
-
-      for (; x < srgb1->xsize(); ++x) {
-        const float diff = row1[x] - row2[x];
-        result += diff * diff * weights[c];
+      float yuvdiff[3] = {};
+      for (size_t j = 0; j < 3; j++) {
+        for (size_t k = 0; k < 3; k++) {
+          yuvdiff[j] += yuvmatrix[j][k] * cdiff[k];
+        }
+      }
+      for (size_t j = 0; j < 3; j++) {
+        sum_of_squares[j] += yuvdiff[j] * yuvdiff[j];
       }
     }
   }
-  const float sum = GetLane(SumOfLanes(Load(d, sum_total)));
-  return sum + result;
+  // Weighted PSNR as in JPEG-XL: chroma counts 1/8.
+  const float weights[3] = {6.0f / 8, 1.0f / 8, 1.0f / 8};
+  // Avoid squaring the weight - 1/64 is too extreme.
+  double norm = 0;
+  for (size_t i = 0; i < 3; i++) {
+    norm += std::sqrt(sum_of_squares[i]) * weights[i];
+  }
+  // This function returns distance *squared*.
+  return norm * norm;
 }
 
-#include <hwy/end_target-inl.h>
+// NOLINTNEXTLINE(google-readability-namespace-comments)
+}  // namespace HWY_NAMESPACE
 }  // namespace jxl
-#include <hwy/after_namespace-inl.h>
+HWY_AFTER_NAMESPACE();
 
 #if HWY_ONCE
 namespace jxl {
-HWY_EXPORT(ComputeDistanceP)
+HWY_EXPORT(ComputeDistanceP);
 double ComputeDistanceP(const ImageF& distmap, const ButteraugliParams& params,
                         double p) {
   return HWY_DYNAMIC_DISPATCH(ComputeDistanceP)(distmap, params, p);
 }
 
-HWY_EXPORT(ComputeDistance2)
+HWY_EXPORT(ComputeDistance2);
 double ComputeDistance2(const ImageBundle& ib1, const ImageBundle& ib2) {
   return HWY_DYNAMIC_DISPATCH(ComputeDistance2)(ib1, ib2);
 }

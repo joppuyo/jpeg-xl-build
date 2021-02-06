@@ -16,60 +16,79 @@
 #define TOOLS_DJXL_H_
 
 #include <stddef.h>
-#include <stdint.h>
 
-#include <string>
-
-#include "jpegxl/decode.h"
-#include "jxl/aux_out.h"
-#include "jxl/aux_out_fwd.h"
-#include "jxl/base/compiler_specific.h"
-#include "jxl/base/data_parallel.h"
-#include "jxl/base/padded_bytes.h"
-#include "jxl/base/span.h"
-#include "jxl/base/status.h"
-#include "jxl/codec_in_out.h"
-#include "jxl/dec_params.h"
+#include "jxl/decode.h"
+#include "lib/jxl/aux_out.h"
+#include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/base/override.h"
+#include "lib/jxl/base/padded_bytes.h"
+#include "lib/jxl/base/status.h"
+#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/dec_params.h"
+#include "tools/args.h"
+#include "tools/box/box.h"
 #include "tools/cmdline.h"
 #include "tools/speed_stats.h"
 
 namespace jpegxl {
 namespace tools {
 
-struct JxlDecompressArgs {
+// Common JPEG XL decompress arguments.
+struct DecompressArgs {
+  // Initialize non-static default options.
+  DecompressArgs() = default;
+
   // Add all the command line options to the CommandLineParser. Note that the
   // options are tied to the instance that this was called on.
-  void AddCommandLineOptions(tools::CommandLineParser* cmdline);
+  void AddCommandLineOptions(CommandLineParser* cmdline);
 
   // Validate the passed arguments, checking whether all passed options are
   // compatible. Returns whether the validation was successful.
-  jxl::Status ValidateArgs();
+  jxl::Status ValidateArgs(const CommandLineParser& cmdline);
 
-  // The parameters.
+  // Common djxl parameters.
+  const char* file_in = nullptr;
+  const char* file_out = nullptr;
+  size_t num_threads;
+  bool use_sjpeg = false;
+  size_t jpeg_quality = 95;
+  bool decode_to_jpeg = false;
+  bool version = false;
+  jxl::Override print_profile = jxl::Override::kDefault;
+  jxl::Override print_info = jxl::Override::kDefault;
+
+  size_t num_reps = 1;
+
+  // Format parameters:
+
   size_t bits_per_sample = 0;
   std::string color_space;  // description
-
-  bool brunsli_fix_dc_staircase = false;
-  bool brunsli_gaborish = false;
 
   jxl::DecompressParams params;
 
   // If true, print the effective amount of bytes read from the bitstream.
   bool print_read_bytes = false;
 
-  bool coalesce = false;
+  // References (ids) of specific options to check if they were matched.
+  CommandLineParser::OptionId opt_num_threads_id = -1;
 };
 
 // Decompresses and notifies SpeedStats of elapsed time.
-jxl::Status DecompressJxl(const JpegxlSignature signature,
-                          const jxl::Span<const uint8_t> compressed,
-                          const jxl::DecompressParams& params,
-                          jxl::ThreadPool* pool,
-                          jxl::CodecInOut* JXL_RESTRICT io,
-                          jxl::AuxOut* aux_out, SpeedStats* JXL_RESTRICT stats);
+jxl::Status DecompressJxlToPixels(const jxl::Span<const uint8_t> compressed,
+                                  const jxl::DecompressParams& params,
+                                  jxl::ThreadPool* pool,
+                                  jxl::CodecInOut* JXL_RESTRICT io,
+                                  jxl::AuxOut* aux_out,
+                                  SpeedStats* JXL_RESTRICT stats);
 
-jxl::Status WriteJxlOutput(const JxlDecompressArgs& args, const char* file_out,
-                           const jxl::CodecInOut& io);
+jxl::Status DecompressJxlToJPEG(const JpegXlContainer& container,
+                                const DecompressArgs& args,
+                                jxl::ThreadPool* pool, jxl::PaddedBytes* output,
+                                jxl::AuxOut* aux_out,
+                                SpeedStats* JXL_RESTRICT stats);
+
+jxl::Status WriteJxlOutput(const DecompressArgs& args, const char* file_out,
+                           jxl::CodecInOut& io);
 
 }  // namespace tools
 }  // namespace jpegxl

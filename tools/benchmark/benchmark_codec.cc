@@ -22,18 +22,18 @@
 #include <utility>
 #include <vector>
 
-#include "jxl/base/data_parallel.h"
-#include "jxl/base/os_specific.h"
-#include "jxl/base/padded_bytes.h"
-#include "jxl/base/profiler.h"
-#include "jxl/base/span.h"
-#include "jxl/base/status.h"
-#include "jxl/codec_in_out.h"
-#include "jxl/color_encoding.h"
-#include "jxl/color_management.h"
-#include "jxl/image.h"
-#include "jxl/image_bundle.h"
-#include "jxl/image_ops.h"
+#include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/base/os_specific.h"
+#include "lib/jxl/base/padded_bytes.h"
+#include "lib/jxl/base/profiler.h"
+#include "lib/jxl/base/span.h"
+#include "lib/jxl/base/status.h"
+#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/color_encoding_internal.h"
+#include "lib/jxl/color_management.h"
+#include "lib/jxl/image.h"
+#include "lib/jxl/image_bundle.h"
+#include "lib/jxl/image_ops.h"
 #include "tools/benchmark/benchmark_args.h"
 #include "tools/benchmark/benchmark_codec_custom.h"
 #ifdef BENCHMARK_JPEG
@@ -144,9 +144,9 @@ class NoneCodec : public ImageCodec {
     memcpy(&ysize, compressed.data() + 4, 4);
     Image3F image(xsize, ysize);
     ZeroFillImage(&image);
-    io->metadata.SetFloat32Samples();
-    io->metadata.color_encoding = ColorEncoding::SRGB();
-    io->SetFromImage(std::move(image), io->metadata.color_encoding);
+    io->metadata.m.SetFloat32Samples();
+    io->metadata.m.color_encoding = ColorEncoding::SRGB();
+    io->SetFromImage(std::move(image), io->metadata.m.color_encoding);
     const double end = Now();
     speed_stats->NotifyElapsed(end - start);
     return true;
@@ -166,8 +166,10 @@ ImageCodecPtr CreateImageCodec(const std::string& description) {
   ImageCodecPtr result;
   if (name == "jxl") {
     result.reset(CreateNewJxlCodec(*Args()));
+#if !defined(__wasm__)
   } else if (name == "custom") {
     result.reset(CreateNewCustomCodec(*Args()));
+#endif
 #ifdef BENCHMARK_JPEG
   } else if (name == "jpeg") {
     result.reset(CreateNewJPEGCodec(*Args()));
