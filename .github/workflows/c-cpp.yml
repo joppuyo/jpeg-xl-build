@@ -17,6 +17,8 @@ jobs:
         submodules: recursive
     - name: Install dependencies
       run: brew install clang-format coreutils cmake giflib ninja parallel doxygen libjpeg
+    - name: Install more dependencies
+      run: ./deps.sh
     - name: Build
       run: export PATH=/usr/local/opt/llvm/bin:$PATH &&
            ./ci.sh release
